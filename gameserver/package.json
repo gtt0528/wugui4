@@ -1,0 +1,19 @@
+{
+  "name": "wugui4-gameserver",
+  "version": "0.1.0",
+  "private": true,
+  "description": "乌龟4 联机对战服：直接复用 assets/scripts/core 下的 TS 引擎，服务器权威",
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "start": "node dist/gameserver/src/server.js",
+    "smoke": "node test/smoke.js"
+  },
+  "dependencies": {
+    "ws": "^8.18.0"
+  },
+  "devDependencies": {
+    "typescript": "^5.5.4",
+    "@types/node": "^22.5.0",
+    "@types/ws": "^8.5.12"
+  }
+}

@@ -1,0 +1,22 @@
+{
+  "compilerOptions": {
+    "target": "es2020",
+    "module": "commonjs",
+    "moduleResolution": "node",
+    "outDir": "dist",
+    "rootDir": "..",
+    "strict": true,
+    "esModuleInterop": true,
+    "skipLibCheck": true,
+    "forceConsistentCasingInFileNames": true,
+    "sourceMap": false,
+    "types": ["node"]
+  },
+  "include": [
+    "src/**/*.ts",
+    "../assets/scripts/core/**/*.ts"
+  ],
+  "exclude": [
+    "../assets/scripts/core/Profile.ts"
+  ]
+}
