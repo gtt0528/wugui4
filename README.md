@@ -358,6 +358,15 @@ cd gameserver && npm run smoke
 
 ### 协议摘要（gameserver）
 
-- 客户端：`login` → `join` → `ready`（4 家都 ready 自动开局）→ `act`（auto/play/pass）→ `next`
-- 服务器：`loginOk` / `roomOk` / `roundStart` / `hand`（私密手牌）/ `turn` / `played` / `state` / `roundEnd` / `error`
-- 掉线重连：同 userId 重进 join 会坐回原位（牌局快照恢复开发中）
+- 客户端：`login`（带 `userId`+`token` 表示重连）→ `join` / `create` / `joinCode` → `ready` → `act`（play/pass/auto）→ `next`；主动退出发 `leave`；心跳 `ping`
+- 服务器：`loginOk`（**签发 userId+token**）/ `roomOk`（含 6 位房间号 `code`）/ `roundStart` / `hand`（私密手牌）/ `turn` / `exTurn` / `ex` / `timer` / `played` / `state` / `roundEnd` / `tip` / `roomClosed` / `error`
+- **掉线重连**：服务器签发 userId+token，同身份重连自动坐回原位并 `sync` 拉牌局快照。
+  牌局中掉线**不再解散房间**，座位保留、由超时托管继续打；只有明确发 `leave`（点「退出游戏」）才算主动退出
+- **回合计时**：交牌每步 20 秒、出牌 20 秒，超时按「系统建议」自动执行
+  （敌人交最大的 N 张、还小牌给最小的 N 张、挑牌拿桌上最大的）。连续超时 2 次进入托管，
+  之后每步 1 秒快速推进，不会让一个人拖死全场。
+  参数可用环境变量调：`WG_EX_WAIT=10 WG_PLAY_WAIT=10 npm start`
+- **匹配**：等 30 秒还不满 4 人 → AI 补位开局；私有房用 6 位房间号邀请，不参与快速匹配
+- **对局记录**：每局结束落盘 `gameserver/logs/rounds-YYYY-MM-DD.jsonl`
+  （时间/房间/四家昵称/敌人/胜负/名次/时长/掉线座位/托管座位），不依赖 MySQL，起服就有数据
+- **安全**：userId 由服务器签发，客户端伪造的 userId 不再被采信；ws 每 20 秒心跳一次，两轮无响应即回收

@@ -225,6 +225,10 @@ export default class OnlineGameView extends cc.Component {
         // 消息接管
         this.net.onMsg = (m: ServerMsg) => this.onServerMsg(m);
         this.net.onClosed = () => this.showDisconnected();
+        // 断线自动重连：手机上切后台、锁屏、地铁断网都会走这里，重连成功会自动 sync 恢复牌局
+        this.net.onReconnecting = (tries: number) => {
+            this.flash(`网络不稳，正在重连（${tries}/5）…`, 3);
+        };
 
         // 后台标签页 rAF 会暂停。飞牌与发牌都用「真实墙钟」驱动：
         // 切回前台时按当前时刻补齐进度——还在飞的牌显示在它此刻该在的位置并继续飞完，
@@ -1962,16 +1966,17 @@ export default class OnlineGameView extends cc.Component {
 
     private showDisconnected(): void {
         this.clearPop();
-        const p = createPanel(560, 260, cc.color(12, 32, 24, 245), cc.color(226, 190, 100), 16);
+        const p = createPanel(600, 300, cc.color(12, 32, 24, 245), cc.color(226, 190, 100), 16);
         p.parent = this.layerPop;
-        const t = createMultiline('与服务器的连接已断开\n（掉线后可以重新匹配，会坐回原位）',
-            24, cc.color(240, 235, 215), 0, 40, 500);
+        const t = createMultiline(
+            '与服务器的连接已断开（重连 5 次都没成功）\n\n其他玩家会把你这局托管打完，\n回到主菜单重新匹配即可。',
+            22, cc.color(240, 235, 215), 0, 40, 540);
         t.parent = p;
         const back = createButton('返回主菜单', {
             fill: cc.color(160, 80, 66), fontSize: 22, width: 180, height: 52,
-        }, () => this.backToMenu());
+        }, () => { this.net.close(); this.backToMenu(); });
         back.parent = p;
-        back.setPosition(0, -70);
+        back.setPosition(0, -80);
     }
 
     private confirmExit(): void {

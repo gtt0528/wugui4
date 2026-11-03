@@ -75,9 +75,9 @@ async function main() {
     const noStart = bots.every((b) => !b.take((m) => m.t === 'roundStart' && m.roundNo > 1));
     console.log(`未结束时点 next 被忽略: ${noStart ? 'PASS' : 'FAIL'}`);
 
-    console.log('\n--- 测试 ②：有人退出 → 房间解散 ---');
-    // 甲直接断线退出
-    bots[0].ws.close();
+    console.log('\n--- 测试 ②：有人主动退出 → 房间解散 ---');
+    // 甲主动退出：按协议先发 leave（不发 leave 的 ws.close() 属于"掉线"，座位会保留等他重连）
+    bots[0].send({ t: 'leave' });
     const closed = await Promise.all(bots.slice(1).map((b) => b.waitFor((m) => m.t === 'roomClosed', 6000, 'roomClosed')));
     console.log(`其余 3 家收到 roomClosed: ${closed.every((m) => !!m.msg) ? 'PASS' : 'FAIL'}（${closed[0].msg}）`);
 

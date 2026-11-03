@@ -12,6 +12,8 @@ import {
     loadProfile, saveProfile, canPlay, applyRelief, winRate, RELIEF_SCORE,
 } from '../core/Profile';
 import { NetClient } from '../net/NetClient';
+import { setupShare, share, launchQuery, showRewardedAd, isWechat } from '../net/WxAdapter';
+import { serverCfg, prodNotConfigured } from '../net/Config';
 
 const { ccclass } = cc._decorator;
 
@@ -42,6 +44,19 @@ export default class MenuScene extends cc.Component {
         this.buildModes();
         this.buildFooter();
         this.refreshProfile();
+
+        // 转发文案：带上房间号，好友点开卡片能直接进同一个房间
+        setupShare(() => ({
+            title: this.myCode ? `乌龟4 · 房间 ${this.myCode}，来一局？` : '乌龟4 · 两广经典四人牌',
+            query: this.myCode ? `code=${this.myCode}` : '',
+        }));
+
+        // 好友从分享卡片点进来（带 code）→ 直接进房
+        const invite = launchQuery().code || this.urlCode();
+        if (invite) {
+            this.scheduleOnce(() => this.startOnline('join', String(invite)), 0.5);
+        }
+
         // 首次进入：性别没填过就弹资料卡（昵称 + 性别，联机时展示给同桌）
         if (loadProfile().gender === 0) {
             this.scheduleOnce(() => this.showProfileSetup(), 0.2);
@@ -153,9 +168,9 @@ export default class MenuScene extends cc.Component {
 
     private buildModes(): void {
         const modes: ModeDef[] = [
-            { key: 'match', title: '开始匹配', desc: '联机匹配 3 位玩家\n（需启动对战服）', enabled: true },
-            { key: 'room', title: '创建房间', desc: '邀请好友一起打\n（联机功能开发中）', enabled: false },
-            { key: 'ai', title: '人机对战', desc: '1 人 + 3 个 AI\n现在就能玩', enabled: true },
+            { key: 'match', title: '开始匹配', desc: '和线上玩家凑一桌\n最多等 30 秒，人不够由机器人补位', enabled: true },
+            { key: 'room', title: '创建房间', desc: '生成 6 位房间号\n微信发给好友一起打', enabled: true },
+            { key: 'ai', title: '人机对战', desc: '1 人 + 3 个 AI\n不用联网也能玩', enabled: true },
         ];
 
         const cardW = 300;
@@ -207,60 +222,88 @@ export default class MenuScene extends cc.Component {
 
     private onModeClick(m: ModeDef): void {
         if (m.key === 'ai') { this.startAIGame(); return; }
-        if (m.key === 'match') { this.startMatch(); return; }
-        this.showToast('创建房间功能开发中\n先玩「开始匹配」或「人机对战」');
+        if (m.key === 'match') { this.startOnline('match'); return; }
+        if (m.key === 'room') { this.startOnline('create'); return; }
+        this.showToast('该模式暂未开放');
     }
 
-    // ================= 联机匹配 =================
+    // ================= 联机 =================
 
     private matchStatus: cc.Label | null = null;
-    private onlineCount: number = 1;       // 当前房间在线人数（用于匹配文案同步）
+    private onlineCount: number = 1;
+    /** 自己房间的房间号（私房才有） */
+    private myCode: string = '';
+    private codeLabel: cc.Label | null = null;
+    private inviteBtnNode: cc.Node | null = null;
+    private pendingMode: 'match' | 'create' | 'join' = 'match';
+    private pendingCode = '';
 
     /**
-     * 联机流程：连对战服 → 登录（用本地昵称）→ join 快速进房。
-     * 之后房间面板、准备、开局进 game 场景都由服务器消息驱动。
+     * 联机入口：连服 → 登录 → （快速匹配 / 开房 / 按房间号进）。
      */
-    private startMatch(): void {
+    private startOnline(mode: 'match' | 'create' | 'join', code = ''): void {
         const net = NetClient.inst;
-        if (net.connected) { net.join(); return; }   // 已连接（比如从牌局退回）直接再进房
+        if (net.connected) {
+            if (mode === 'create') net.create();
+            else if (mode === 'join') net.joinCode(code);
+            else net.join();
+            return;
+        }
 
-        this.showMatchPanel('正在连接对战服…');
+        this.pendingMode = mode;
+        this.pendingCode = code;
+        this.myCode = '';
+        this.showMatchPanel(mode === 'create' ? '正在创建房间…' : '正在连接对战服…');
+
+        // 微信里地址还是占位符时，直接说清楚，别让人对着 8 秒超时发呆
+        if (isWechat() && prodNotConfigured()) {
+            this.setMatchStatus('线上服务器地址还没配置\n请先在 net/Config.ts 里填好 wss 域名');
+            return;
+        }
 
         net.connect().then(() => {
             this.setMatchStatus('已连接，正在登录…');
             net.onMsg = (msg) => this.onMatchMsg(msg, net);
+            net.onClosed = () => this.showMatchPanel('连接已断开\n请检查网络，或确认对战服是否启动');
             const p = loadProfile();
             net.login(p.nick, p.gender);
         }).catch((err: Error) => {
-            this.showMatchPanel('连接失败：' + err.message + '\n\n请先启动对战服：\ncd gameserver && npm start');
+            this.showMatchPanel(
+                '连接失败：' + err.message +
+                '\n\n目标地址：' + serverCfg().ws +
+                '\n本地联机请先启动：cd gameserver && npm start');
         });
     }
 
     private onMatchMsg(msg: any, net: NetClient): void {
         switch (msg.t) {
             case 'loginOk':
-                this.setMatchStatus('登录成功，正在匹配房间…');
                 net.userId = msg.userId;
-                net.join();
+                this.setMatchStatus('登录成功，正在进房…');
+                if (this.pendingMode === 'create') net.create();
+                else if (this.pendingMode === 'join') net.joinCode(this.pendingCode);
+                else net.join();
                 break;
             case 'roomOk':
                 net.mySeat = msg.seat;
                 net.roomId = msg.roomId;
+                this.myCode = msg.code ? String(msg.code) : '';
                 this.onlineCount = msg.members ? msg.members.filter((m: any) => !m.empty).length : 1;
                 // 进房即自动准备：4 家都进房且都准备了，服务器自动开局
                 net.ready();
+                this.refreshInvite();
                 this.setMatchStatus(
-                    `已进房 ${net.roomId}（你是 ${msg.seat + 1} 号位），已自动准备\n` +
-                    `还差 ${4 - this.onlineCount} 位玩家，人齐后自动开局…`);
+                    this.myCode
+                        ? `房间 ${this.myCode} · 你是 ${msg.seat + 1} 号位\n把房间号发给好友，人齐自动开局`
+                        : `已进房（${msg.seat + 1} 号位），已自动准备\n还差 ${4 - this.onlineCount} 位玩家，30 秒内不够会由机器人补位`);
                 break;
             case 'readyCount':
-                this.setMatchStatus(`房间 ${net.roomId} · ${this.onlineCount}/4 人 · 准备 ${msg.ready}/${msg.need}，4 家齐了自动开局`);
+                this.setMatchStatus(`房间 ${this.myCode || net.roomId} · ${this.onlineCount}/4 人 · 准备 ${msg.ready}/${msg.need}`);
                 break;
             case 'memberUpdate': {
-                // 有人进房/退房：实时刷新房间人数（别人取消匹配时 2/4 → 1/4）
                 const list: any[] = msg.members || [];
                 this.onlineCount = list.filter((m) => !m.empty).length;
-                this.setMatchStatus(`房间 ${net.roomId} · ${this.onlineCount}/4 人，人齐后自动开局`);
+                if (!this.myCode) this.setMatchStatus(`房间 ${net.roomId} · ${this.onlineCount}/4 人，人齐后自动开局`);
                 break;
             }
             case 'roundStart':
@@ -280,11 +323,25 @@ export default class MenuScene extends cc.Component {
 
     private showMatchPanel(text: string): void {
         this.clearPop();
-        const p = createPanel(620, 340, cc.color(14, 40, 30, 248), cc.color(220, 190, 100), 16);
+        const p = createPanel(700, 440, cc.color(14, 40, 30, 248), cc.color(220, 190, 100), 16);
         p.parent = this.layerPop;
-        const st = createMultiline(text, 22, cc.color(235, 245, 230), 0, 40, 560);
+        const st = createMultiline(text, 22, cc.color(235, 245, 230), 0, 110, 620);
         st.parent = p;
         this.matchStatus = st.getComponent(cc.Label) || null;
+
+        // 房间号（私房才显示大字）
+        const codeLbl = createLabel('', 34, cc.color(255, 226, 140), 0, -10);
+        codeLbl.parent = p;
+        codeLbl.getComponent(cc.Label)!.horizontalAlign = cc.Label.HorizontalAlign.CENTER;
+        this.codeLabel = codeLbl.getComponent(cc.Label)!;
+
+        const invite = createButton('邀请好友', {
+            fill: cc.color(70, 140, 200), fontSize: 22, width: 170, height: 50,
+        }, () => this.inviteFriend());
+        invite.parent = p;
+        invite.setPosition(-100, -110);
+        invite.active = false;
+        this.inviteBtnNode = invite;
 
         const cancel = createButton('取消', {
             fill: cc.color(140, 74, 62), fontSize: 22, width: 150, height: 50,
@@ -293,12 +350,46 @@ export default class MenuScene extends cc.Component {
             this.clearPop();
         });
         cancel.parent = p;
-        cancel.setPosition(0, -110);
+        cancel.setPosition(100, -110);
+
+        this.refreshInvite();
+    }
+
+    /** 房间号变化后刷新显示 */
+    private refreshInvite(): void {
+        if (this.codeLabel && this.codeLabel.isValid) {
+            this.codeLabel.string = this.myCode ? `房间号 ${this.myCode}` : '';
+        }
+        if (this.inviteBtnNode && this.inviteBtnNode.isValid) {
+            this.inviteBtnNode.active = !!this.myCode;
+        }
+    }
+
+    /** 邀请好友：微信里拉起转发卡片（带 code 参数，好友点开直接进房） */
+    private inviteFriend(): void {
+        const code = this.myCode;
+        if (!code) return;
+        if (!isWechat()) {
+            this.showToast(`房间号：${code}\n网页版把房间号告诉好友即可；\n微信里可直接转发卡片进入`);
+            return;
+        }
+        share(`乌龟4 · 房间 ${code}，来一局？`, `code=${code}`);
     }
 
     private setMatchStatus(text: string): void {
         if (!this.matchStatus || !this.matchStatus.isValid) { this.showMatchPanel(text); return; }
         this.matchStatus.string = text;
+    }
+
+    /** 浏览器预览时支持 ?code=123456 直接进房（方便自己开两个窗口测试） */
+    private urlCode(): string {
+        try {
+            if (typeof location === 'undefined') return '';
+            const m = /[?&]code=(\d+)/.exec(location.search || '');
+            return m ? m[1] : '';
+        } catch (e) {
+            return '';
+        }
     }
 
     private startAIGame(): void {
@@ -327,7 +418,7 @@ export default class MenuScene extends cc.Component {
         tip.parent = this.layerMain;
         tip.getComponent(cc.Label)!.horizontalAlign = cc.Label.HorizontalAlign.CENTER;
 
-        const ver = createLabel('v0.1 单机版', 16, cc.color(110, 155, 135), W / 2 - 90, -H / 2 + 36);
+        const ver = createLabel('v0.2 联机版', 16, cc.color(110, 155, 135), W / 2 - 90, -H / 2 + 36);
         ver.parent = this.layerMain;
         ver.getComponent(cc.Label)!.horizontalAlign = cc.Label.HorizontalAlign.CENTER;
     }
@@ -419,13 +510,17 @@ export default class MenuScene extends cc.Component {
             24, cc.color(255, 240, 205), 0, 60, 520);
         t.parent = p;
 
-        const ok = createButton('领取救济分', {
+        const ok = createButton(isWechat() ? '看广告领取' : '领取救济分', {
             fill: cc.color(226, 150, 50), fontSize: 22, width: 180, height: 50,
         }, () => {
-            applyRelief();
-            this.refreshProfile();
             this.clearPop();
-            this.showToast('已领取 ' + RELIEF_SCORE + ' 积分');
+            showRewardedAd().then((watched) => {
+                // 微信里必须完整看完；浏览器 / 未配广告位时直接给（本地调试用）
+                if (isWechat() && !watched) { this.showToast('看完广告才能领哦'); return; }
+                applyRelief();
+                this.refreshProfile();
+                this.showToast('已领取 ' + RELIEF_SCORE + ' 积分');
+            });
         });
         ok.parent = p;
         ok.setPosition(-110, -95);
@@ -450,23 +545,28 @@ export default class MenuScene extends cc.Component {
 
         const text = [
             '【身份】持方块4 的人是「敌人」，其余 3 人是「乌龟」，彼此不知情。',
-            '【目标】第一个出完牌的人决定胜负：',
-            '   · 敌人第一个出完 → 敌人赢，抓走所有乌龟；',
-            '   · 乌龟先出完 → 它成为「导游」，牌局继续，剩下乌龟接着抢「中游」，',
-            '     最后一个没出完的乌龟就是「尾游」，被敌人抓走。',
+            '【目标】敌人出完牌的那一刻结算：',
+            '   · 所有乌龟都已经出完 → 乌龟方赢；',
+            '   · 还有乌龟没出完 → 敌人赢，没出完的乌龟「被抓走」，本局立即结束。',
+            '   赶在敌人出完之前出完的乌龟，按顺序叫 导游 / 中游 / 尾游；被抓走的不算名次。',
             '【牌力】4<5<6<…<A<2<3<小王<大王；同点看花色 方块<梅花<红桃<黑桃。',
-            '【牌型】单张 / 对子 / 三张 / 鸡(4张同点) / 三带二 / 顺子(5张连续) /',
-            '         同一色(5张同色) / 一条龙(5张同色连续) / 4带1。',
-            '         2、3、王不能进顺子和一条龙，王只能单出。',
-            '【交牌】从第 2 局起，先在开局交换牌：',
-            '   ① 上一局输了的乌龟，把手上最大的牌交给敌人；',
-            '   ② 敌人把大牌按 导游 > 中游 的顺序各给一张；',
-            '   ③ 导游 / 中游各还一张小牌给敌人。',
-            '   刚换来的牌当次不能马上再换出去。',
+            '【牌型】单张 / 对子 / 三张 / 鸡(4张同点) / 三带二 / 顺子 / 同一花色 / 一条龙 / 4带1。',
+            '   五张的牌型可以互压：一条龙 > 4带1 > 三带二 > 顺子 > 同一花色；',
+            '   同一花色先比花色，再比这五张里最大那张的点数。',
+            '   2、3、大小王不能进顺子/一条龙；大王+小王放一起算一对（能压任何对子）。',
+            '【交牌】从第 2 局起，开局先交牌（桌上抢牌）：',
+            '   ① 敌人挑最大的 N 张摆到桌子中间（N = 游客人数）',
+            '   ② 导游 → 中游 → 尾游 依次从桌上挑一张拿走',
+            '   ③ 各游客再各还一张给敌人（不必最小）',
+            '   ④ 被抓龟各交一张最大的牌给敌人',
+            '   ⑤ 敌人一次摆 M 张小牌到桌上，被抓龟按「谁交的大牌大」顺序挑',
+            '   方块4 永远不能交；本局刚换来的牌不能再交出去。',
+            '【先手】交牌中交出最大那张牌的人先出；首局由持梅花4 的人先出。',
+            '【计时】轮到谁交牌 / 出牌有 20 秒倒计时，超时系统自动帮你交（大牌交最大的、还牌给最小的）。',
             '【积分】初始 1000 分，赢一局 +15，输一局 -10。',
         ].join('\n');
 
-        const body = createMultiline(text, 18, cc.color(232, 240, 225), 0, 12, w - 90);
+        const body = createMultiline(text, 16, cc.color(232, 240, 225), 0, 6, w - 80);
         body.parent = p;
         body.anchorY = 0.5;
 

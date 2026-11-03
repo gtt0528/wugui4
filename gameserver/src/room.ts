@@ -10,7 +10,19 @@
 import { GameEngine, Phase, SEAT_COUNT } from '../../assets/scripts/core/GameEngine';
 import type { Card } from '../../assets/scripts/core/Card';
 import { parsePattern, canBeat } from '../../assets/scripts/core/Pattern';
+import { appendRound, RoundRecord, SeatRecord } from './recorder';
 import type { WebSocket } from 'ws';
+
+/**
+ * 计时参数（秒）。可用环境变量调，方便压测/试玩时缩短等待：
+ *   WG_EX_WAIT=5 WG_PLAY_WAIT=5 npm start
+ */
+export const EXCHANGE_TIMEOUT = Number(process.env.WG_EX_WAIT || 20);
+export const PLAY_TIMEOUT = Number(process.env.WG_PLAY_WAIT || 20);
+/** AI 补位 / 已托管的座位"思考"时间（秒）——借同一条托管路径，不另写一套逻辑 */
+export const AI_THINK = Number(process.env.WG_AI_THINK || 1);
+/** 连续超时几次后进入托管（之后该座位每一步只等 AI_THINK 秒，不再拖全场） */
+export const AUTO_PILOT_AFTER = 2;
 
 export interface Member {
     seat: number;
@@ -19,12 +31,28 @@ export interface Member {
     gender: number;                 // 0 未知 1 男 2 女
     avatar: string;                 // 头像 URL（微信头像 / 默认头像标识），可为空
     ws: WebSocket | null;          // null = 掉线（可重连）
+    /** 掉线时刻（ms）；重连后清空 */
+    offlineAt?: number;
+    /** 本局是否掉线过（只用于统计） */
+    droppedThisRound?: boolean;
+    /** 是否 AI 补位 */
+    isAI?: boolean;
 }
 
 let roomSeq = 1;
+let codeSeq = 100000;
+
+/** 生成 6 位房间号（递增，保证同一进程内不重复） */
+export function makeRoomCode(): string {
+    return String(codeSeq++);
+}
 
 export class Room {
     id: string;
+    /** 6 位房间号，给「创建房间 / 邀请好友」用 */
+    code: string;
+    /** 是否是「创建房间」开的私有房（不参与快速匹配） */
+    isPrivate = false;
     members: (Member | null)[] = [null, null, null, null];
     engine: GameEngine;
     readyFlags = new Set<number>();   // 每个座位都 ready 才能开局，防止重复 startRound
@@ -33,12 +61,26 @@ export class Room {
     revealed = false;
     /** 当前倒计时所在座位（-1 = 无人计时） */
     timerSeat = -1;
+    /** 倒计时总秒数（供客户端画进度环） */
+    timerTotal = 0;
     /** 倒计时截止的绝对时间戳（ms） */
     deadline = 0;
     private timer: NodeJS.Timeout | null = null;
+    /** 本局开始时间（ms），用于统计局时长 */
+    roundStartedAt = 0;
+    /** 开始等人凑满的时间（ms），用于匹配超时 AI 补位 */
+    waitSince = Date.now();
+    /** 本局被「超时托管」推进过的座位（只统计真人） */
+    timeoutSeats = new Set<number>();
+    /** 每个座位连续超时次数（手动操作会清零） */
+    private timeouts = new Map<number, number>();
+    /** 已进入托管的座位：之后每一步只等 1 秒，别让一个人拖死全场 */
+    private autoPilot = new Set<number>();
 
-    constructor() {
+    constructor(isPrivate = false) {
         this.id = 'R' + String(roomSeq++).padStart(4, '0');
+        this.code = makeRoomCode();
+        this.isPrivate = isPrivate;
         this.engine = new GameEngine({ humanSeat: 0, minRounds: 1, allHuman: true });
     }
 
@@ -56,14 +98,24 @@ export class Room {
 
     /** 返回 null=加入失败，否则返回分配的座位 */
     join(userId: number, nickname: string, ws: WebSocket, gender = 0, avatar = ''): number | null {
-        // 重连：同一 userId 优先坐回原位
+        // 房间从空变为有人 → 重新开始计算"等凑人"的时间
+        if (this.isEmpty()) this.waitSince = Date.now();
+        // 重连：同一 userId 优先坐回原位（牌局进行中也保留座位）
         for (let s = 0; s < SEAT_COUNT; s++) {
             const m = this.members[s];
-            if (m && m.userId === userId) {
+            if (m && !m.isAI && m.userId === userId) {
+                const back = !m.ws;
                 m.ws = ws;
                 m.nickname = nickname;
                 m.gender = gender;
                 m.avatar = avatar;
+                m.offlineAt = undefined;
+                if (back) {
+                    this.broadcast({ t: 'memberUpdate', members: this.membersView() });
+                    this.broadcast({ t: 'tip', msg: `${m.nickname} 已重新连接` });
+                    // 正好轮到他 → 重新给满时间，别让人一回来就只剩 2 秒
+                    if (this.timerSeat === s) this.startTimerFor(s, this.currentTimeoutSeconds(s));
+                }
                 return s;
             }
         }
@@ -95,19 +147,28 @@ export class Room {
     }
 
     /**
-     * 未开局（或本局已结束）时真正退出房间：释放座位、清 ready、广播成员变化。
-     * 牌局进行中则只标记离线（leave），由托管推进。返回是否真的移除了。
+     * 掉线 / 退出。
+     *
+     * 关键改动（手机端）：**牌局进行中不再解散房间**。
+     * 切后台、锁屏、地铁进隧道都会断一次，旧逻辑会把另外三个人直接踢出牌局。
+     * 现在改为：保留座位 + 标记离线 + 广播提示，由「超时托管」把牌局继续打下去；
+     * 局末再清理确实没回来的人，等他重连（同 userId 坐回原位）。
      */
     removeIfIdle(seat: number): boolean {
-        if (this.inRound() && this.members[seat]) {
-            // 牌局进行中有人退出/掉线：没有倒计时托管，缺人会卡死牌局 → 直接解散
-            this.leave(seat);
-            if (this.engine.roundNo > 0 && !this.closed) {
-                this.dissolve('有玩家退出了游戏，房间解散，请重新匹配');
-            }
+        const m = this.members[seat];
+        if (!m) return false;
+
+        if (this.inRound()) {
+            m.ws = null;
+            m.offlineAt = Date.now();
+            m.droppedThisRound = true;
+            this.broadcast({ t: 'memberUpdate', members: this.membersView() });
+            this.broadcast({ t: 'tip', msg: `${m.nickname} 掉线了，超时会自动托管，等他回来` });
+            // 正好轮到他 → 立即按正常时长重新计时，让他有机会连回来再操作
+            if (this.timerSeat === seat) this.startTimerFor(seat, this.currentTimeoutSeconds(seat));
             return true;
         }
-        if (!this.members[seat]) return false;
+
         this.members[seat] = null;
         this.readyFlags.delete(seat);
         this.retractNextVote(seat);
@@ -128,6 +189,30 @@ export class Room {
         return this.members.every((m) => m === null);
     }
 
+    /**
+     * 主动退出（客户端明确发 {t:'leave'}，比如点了「退出游戏」）。
+     *
+     * 与「掉线」严格区分：
+     *   - 主动退出：座位立刻释放，本局作废（打过局就解散房间，其余人回匹配）
+     *   - 掉线（ws 断开但没发 leave，比如锁屏/切后台）：见 removeIfIdle，座位保留 + 托管
+     */
+    forceLeave(seat: number): void {
+        const m = this.members[seat];
+        if (!m) return;
+        this.members[seat] = null;
+        this.readyFlags.delete(seat);
+        this.retractNextVote(seat);
+        this.clearTimer();
+        this.broadcast({ t: 'memberUpdate', members: this.membersView() });
+        if (this.engine.roundNo > 0 && !this.closed) {
+            this.dissolve(`${m.nickname} 退出了游戏，房间解散，请重新匹配`);
+        } else if (this.isEmpty()) {
+            this.dissolve('玩家都离开了');
+        } else {
+            this.broadcast({ t: 'readyCount', ready: this.readyFlags.size, need: SEAT_COUNT });
+        }
+    }
+
     /** 局结束后调用：把已断线未重连的成员移出房间并广播 */
     private purgeOffline(): void {
         if (this.inRound()) return;
@@ -137,13 +222,11 @@ export class Room {
             if (m && !m.ws) { this.members[s] = null; this.readyFlags.delete(s); this.retractNextVote(s); changed = true; }
         }
         if (!changed) return;
-        // 打过局的房间缺了人 → 解散回匹配；一局都没打过 → 继续凑人
-        if (this.engine.roundNo > 0) {
-            this.dissolve('有玩家掉线退出，房间解散，请重新匹配');
-        } else {
-            this.broadcast({ t: 'memberUpdate', members: this.membersView() });
-            this.broadcast({ t: 'readyCount', ready: this.readyFlags.size, need: SEAT_COUNT });
-        }
+        // 局末清理：把真没回来的（以及 AI 补位）请出房间，但**不解散**。
+        // 剩下的人等着重连或新人补位，比被踢回匹配界面好得多。
+        this.broadcast({ t: 'memberUpdate', members: this.membersView() });
+        this.broadcast({ t: 'readyCount', ready: this.readyFlags.size, need: SEAT_COUNT });
+        if (this.isEmpty()) this.dissolve('玩家都离开了');
     }
 
     /** 房间销毁前的清理（防止定时器泄漏） */
@@ -188,7 +271,7 @@ export class Room {
 
     membersView(): object[] {
         return this.members.map((m, s) => m
-            ? { seat: m.seat, userId: m.userId, nickname: m.nickname, gender: m.gender, avatar: m.avatar, connected: !!m.ws }
+            ? { seat: m.seat, userId: m.userId, nickname: m.nickname, gender: m.gender, avatar: m.avatar, connected: !!m.ws, ai: !!m.isAI }
             : { seat: s, empty: true });
     }
 
@@ -205,7 +288,12 @@ export class Room {
         this.revealed = false;          // 新一局重新隐藏敌人身份
         this.exchangeLogSent = 0;       // 交牌动画广播进度归零
         this.exchangeJustDone = false;
+        this.timeoutSeats.clear();      // 本局托管统计归零
+        this.timeouts.clear();
+        this.autoPilot.clear();         // 新局重新给每个人 20 秒
+        for (const m of this.members) if (m) m.droppedThisRound = false;
         this.clearTimer();
+        this.roundStartedAt = Date.now();
         this.engine.startRound();
         // 注意：不广播 enemySeat —— 敌人身份要等他第一次出牌才暴露（防作弊/防剧透）
         this.broadcast({
@@ -235,6 +323,49 @@ export class Room {
             return true;
         }
         return false;
+    }
+
+    /**
+     * AI 补位：把空座位填上机器人，然后直接开局。
+     *
+     * 冷启动阶段真人很难同时凑满 4 个，玩家点「开始匹配」干等到 1/4 人就会走。
+     * 机器人不打单独的 AI 循环——它们借「1 秒超时托管」这条现成路径出牌，
+     * 所以视觉上就是"机器人思考 1 秒后出牌"，和真人超时的表现一模一样。
+     */
+    fillWithAI(reason = '等待超时，已用机器人补位开局'): boolean {
+        if (this.full()) return false;
+        let added = 0;
+        for (let s = 0; s < SEAT_COUNT; s++) {
+            if (this.members[s]) continue;
+            this.members[s] = {
+                seat: s,
+                userId: -1000 - s,
+                nickname: `机器人${s + 1}号`,
+                gender: 0,
+                avatar: '',
+                ws: null,
+                isAI: true,
+            };
+            this.readyFlags.add(s);
+            added++;
+        }
+        if (!added) return false;
+
+        this.broadcast({ t: 'memberUpdate', members: this.membersView() });
+        this.broadcast({ t: 'readyCount', ready: this.readyFlags.size, need: SEAT_COUNT });
+        this.broadcast({ t: 'tip', msg: reason });
+
+        const p = this.engine.phase;
+        if (this.full() && this.readyFlags.size >= SEAT_COUNT
+            && p !== Phase.EXCHANGE && p !== Phase.PLAYING) {
+            this.startRound();
+        }
+        return true;
+    }
+
+    /** 真人数量（不含 AI） */
+    realCount(): number {
+        return this.members.filter((m) => !!m && !m.isAI).length;
     }
 
     /**
@@ -293,7 +424,10 @@ export class Room {
         // 连上来的时候正好轮到他/别人在倒计时 → 补发剩余秒数
         if (this.timerSeat >= 0 && this.deadline > 0) {
             const left = Math.max(0, Math.ceil((this.deadline - Date.now()) / 1000));
-            this.sendTo(seat, { t: 'timer', seat: this.timerSeat, seconds: left, deadline: this.deadline });
+            this.sendTo(seat, {
+                t: 'timer', seat: this.timerSeat, seconds: left,
+                total: this.timerTotal, deadline: this.deadline,
+            });
         }
     }
 
@@ -302,6 +436,8 @@ export class Room {
     handleAct(seat: number, msg: { kind?: string; cards?: number[] }): void {
         const e = this.engine;
         const kind = msg.kind || 'auto';
+        // 玩家自己动了 → 立刻退出托管，恢复 20 秒正常倒计时
+        this.clearAutoPilot(seat);
 
         if (e.phase === Phase.EXCHANGE) {
             const step = e.currentExchange;
@@ -338,9 +474,7 @@ export class Room {
                     this.sendTo(seat, { t: 'error', msg: '你是领出方，必须出牌' });
                     return;
                 }
-                e.pass(seat);
-                this.broadcast({ t: 'played', seat, pass: true });
-                this.afterEngineChange();
+                this.doPass(seat);
                 return;
             }
             // play 或 auto
@@ -349,9 +483,7 @@ export class Room {
                 const sug = e.aiAction();
                 if (sug.action !== 'play' || !sug.cards || !sug.cards.length) {
                     if (e.lastPattern === null) { this.sendTo(seat, { t: 'error', msg: '领出方不能托管跳过' }); return; }
-                    e.pass(seat);
-                    this.broadcast({ t: 'played', seat, pass: true });
-                    this.afterEngineChange();
+                    this.doPass(seat);
                     return;
                 }
                 cards = sug.cards;
@@ -375,21 +507,38 @@ export class Room {
                 });
                 return;
             }
-            if (!e.playCards(seat, cards)) {
+            if (!this.doPlay(seat, cards)) {
                 this.sendTo(seat, { t: 'error', msg: '这手牌不合法或压不过上家，请重新选牌', keepTurn: true });
                 return;
             }
-            // 敌人（方块4 持有者）第一次出牌 → 向全场暴露身份
-            if (!this.revealed && seat === e.enemySeat) {
-                this.revealed = true;
-                this.broadcast({ t: 'enemyRevealed', seat });
-            }
-            this.broadcast({ t: 'played', seat, cards: cards.map((c) => c.id) });
-            this.afterEngineChange();
             return;
         }
 
         this.sendTo(seat, { t: 'error', msg: '当前阶段不能操作：' + e.phase });
+    }
+
+    // ============ 出牌 / 跳过的唯一出口 ============
+    // 玩家点击和「超时托管」都走这里，保证两条路径的广播顺序、动画完全一致。
+
+    /** 出牌。成功返回 true（内部完成 identity 暴露 + played 广播 + 推进） */
+    private doPlay(seat: number, cards: Card[]): boolean {
+        const e = this.engine;
+        if (!e.playCards(seat, cards)) return false;
+        // 敌人（方块4 持有者）第一次出牌 → 向全场暴露身份
+        if (!this.revealed && seat === e.enemySeat) {
+            this.revealed = true;
+            this.broadcast({ t: 'enemyRevealed', seat });
+        }
+        this.broadcast({ t: 'played', seat, cards: cards.map((c) => c.id) });
+        this.afterEngineChange();
+        return true;
+    }
+
+    /** 跳过 */
+    private doPass(seat: number): void {
+        this.engine.pass(seat);
+        this.broadcast({ t: 'played', seat, pass: true });
+        this.afterEngineChange();
     }
 
     /** 交牌失败原因（与单机版提示文案一致） */
@@ -404,29 +553,151 @@ export class Room {
         }
     }
 
-    /** 托管：按引擎默认策略交牌 */
-    private autoExchange(stepKind: string): boolean {
+    /**
+     * 托管交牌：直接采用引擎给出的「系统建议」，与玩家点牌走同一个 submitExchange。
+     *   ENEMY_PUT      → 手上最大的 N 张（用户要求：大牌本来就是固定的那几张）
+     *   ENEMY_RETURN   → 手上最小的 N 张（用户要求：回小牌默认给最小的）
+     *   TOURIST_PICK   → 桌上最大的一张
+     *   LOSER_PICK     → 桌上最大的一张
+     *   TOURIST_RETURN → 最小的一张
+     *   LOSER_GIVE     → 最大的一张（规则强制）
+     */
+    private autoExchange(): boolean {
         const e = this.engine;
-        if (stepKind === 'ENEMY_PUT' || stepKind === 'ENEMY_RETURN') {
-            return e.submitExchange(e.pendingGiveCards().map((c) => c.id));
-        }
-        if (stepKind === 'TOURIST_PICK' || stepKind === 'LOSER_PICK') {
-            // 超时默认挑：不论大牌堆还是小牌堆，都挑「最大」的那张
-            // （大牌堆挑最大最划算；小牌堆挑最大也是为了拿回相对有价值的牌）
-            return e.submitExchange(this.bestTableCardId());
-        }
-        return e.submitExchange(-1);
+        const ids = e.pendingGiveCards().map((c) => c.id);
+        if (!ids.length) return e.submitExchange(-1);
+        return e.submitExchange(ids);
     }
 
-    /** 桌上最大的一张（超时默认选牌用） */
-    private bestTableCardId(): number {
-        const t = this.engine.tableCards;
-        if (!t.length) return -1;
-        let best = t[0];
-        for (const c of t) {
-            if (c.point > best.point || (c.point === best.point && c.suit > best.suit)) best = c;
+    // ============ 回合计时 ============
+
+    /** 当前该座位应该给多少秒：AI 补位 1 秒，真人交牌 20 秒、出牌 30 秒 */
+    private currentTimeoutSeconds(seat: number): number {
+        const m = this.members[seat];
+        if (m && m.isAI) return AI_THINK;
+        if (this.autoPilot.has(seat)) return AI_THINK;      // 已托管：别每步都拖 20 秒
+        if (m && !m.ws) return AI_THINK;                    // 掉线的人：直接快速托管
+        return this.engine.phase === Phase.EXCHANGE ? EXCHANGE_TIMEOUT : PLAY_TIMEOUT;
+    }
+
+    /**
+     * 记一次真人超时。连续 AUTO_PILOT_AFTER 次 → 进入托管。
+     * 返回 true 表示这一次刚好进入托管（用于提示文案）。
+     */
+    private registerTimeout(seat: number): boolean {
+        const m = this.members[seat];
+        if (!m || m.isAI) return false;
+        this.timeoutSeats.add(seat);
+        const n = (this.timeouts.get(seat) || 0) + 1;
+        this.timeouts.set(seat, n);
+        if (n >= AUTO_PILOT_AFTER && !this.autoPilot.has(seat)) {
+            this.autoPilot.add(seat);
+            return true;
         }
-        return best.id;
+        return false;
+    }
+
+    /** 玩家自己动了 → 退出托管状态 */
+    private clearAutoPilot(seat: number): void {
+        if (this.timeouts.delete(seat)) { /* 已清 */ }
+        this.autoPilot.delete(seat);
+    }
+
+    /**
+     * 给某个座位开始倒计时，并向**全场**广播（四家都能看到谁在想事情）。
+     * 只新增一条 timer 消息，不改变任何既有的广播顺序和动画。
+     */
+    private startTimerFor(seat: number, seconds: number): void {
+        this.clearTimer(true);
+        if (seat < 0) return;
+        const total = Math.max(1, Math.round(seconds));
+        this.timerSeat = seat;
+        this.timerTotal = total;
+        this.deadline = Date.now() + total * 1000;
+        this.broadcast({ t: 'timer', seat, seconds: total, total, deadline: this.deadline });
+        this.timer = setTimeout(() => this.onTimeout(seat), total * 1000);
+    }
+
+    /**
+     * 超时：替这位玩家做出「本来他该点的那个动作」。
+     * 走的是和玩家点击完全相同的入口（submitExchange / doPlay / doPass），
+     * 所以飞牌动画、流程条、身份暴露等视觉表现完全一致，只是少了一次点击。
+     */
+    private onTimeout(seat: number): void {
+        this.timer = null;
+        this.timerSeat = -1;
+        this.deadline = 0;
+        if (this.closed) return;
+
+        const e = this.engine;
+        const m = this.members[seat];
+        const who = m ? m.nickname : `${seat + 1}号位`;
+        const isBot = !m || !!m.isAI;
+        const justAuto = this.registerTimeout(seat);
+
+        /**
+         * 提示只发一次：刚进入托管时说"已进入托管"，
+         * 进入托管之后不再每轮刷屏（否则四家屏幕全是提示）。
+         */
+        const tip = (action: string) => {
+            if (isBot) return;
+            if (justAuto) {
+                this.broadcast({ t: 'tip', msg: `${who} 连续超时，已进入托管（自动${action}）` });
+            } else if (!this.autoPilot.has(seat)) {
+                this.broadcast({ t: 'tip', msg: `${who} 超时，已自动${action}` });
+            }
+        };
+
+        try {
+            if (e.phase === Phase.EXCHANGE) {
+                const step = e.currentExchange;
+                if (!step || step.from !== seat) return;   // 已经推进过了
+                const ok = this.autoExchange();
+                if (!ok) {
+                    // 极端兜底：系统建议也不合法时，直接跳过这一步，避免死等
+                    console.error(`[房间${this.id}] 托管交牌失败 kind=${step.kind}，跳过该步骤`);
+                    e.exchangeSteps.shift();
+                    e.currentExchange = null;
+                    e.advanceExchange();
+                }
+                tip('交牌');
+                this.afterEngineChange();
+                return;
+            }
+
+            if (e.phase === Phase.PLAYING) {
+                if (e.currentSeat !== seat) return;
+                const sug = e.aiAction();
+
+                if (sug.action === 'play' && sug.cards && sug.cards.length && e.playCards(seat, sug.cards)) {
+                    // 复用 doPlay 的后半段（身份暴露 + 广播 + 推进）
+                    if (!this.revealed && seat === e.enemySeat) {
+                        this.revealed = true;
+                        this.broadcast({ t: 'enemyRevealed', seat });
+                    }
+                    this.broadcast({ t: 'played', seat, cards: sug.cards.map((c) => c.id) });
+                    tip('出牌');
+                    this.afterEngineChange();
+                    return;
+                }
+
+                if (e.lastPattern === null) {
+                    // 领出方不能过 → 出一张最小的单牌，保证牌局能继续
+                    const cards = e.players[seat].cards;
+                    const one = cards.length ? cards[cards.length - 1] : null;
+                    if (one && this.doPlay(seat, [one])) tip('打出最小的一张');
+                    return;
+                }
+
+                tip('跳过');
+                this.doPass(seat);
+                return;
+            }
+        } catch (err) {
+            console.error(`[房间${this.id}] 超时托管异常:`, err);
+            // 兜底：别让玩家卡在死界面
+            this.pump();
+        }
     }
 
     /** 引擎状态变化后的统一出口：发手牌 → 广播公共状态 → 推进下一位行动者 */
@@ -452,10 +723,67 @@ export class Room {
         if (this.engine.phase === Phase.ROUND_END || this.engine.phase === Phase.ROUND_WAIT) {
             this.clearTimer();
             this.broadcast({ t: 'roundEnd', result: this.engine.lastResult });
+            this.saveRoundRecord();   // 落盘：每局一行 JSONL，供试玩数据分析
             this.purgeOffline();   // 局结束：把中途掉线没回来的人请出房间，腾出座位
             return;   // 等客户端发 {t:'next'} 再开下一局
         }
         this.pump();
+    }
+
+    /**
+     * 本局记录落盘。放在 purgeOffline 之前——否则掉线者的昵称已经被清掉了。
+     * 任何异常都吞掉，绝不影响牌局。
+     */
+    private saveRoundRecord(): void {
+        try {
+            const e = this.engine;
+            const res = e.lastResult;
+            if (!res) return;
+            const now = Date.now();
+            const seats: SeatRecord[] = [];
+            const offlineSeats: number[] = [];
+            const aiSeats: number[] = [];
+
+            for (let s = 0; s < SEAT_COUNT; s++) {
+                const m = this.members[s];
+                const p = e.players[s];
+                const offline = !!(m && (m.droppedThisRound || !m.ws));
+                seats.push({
+                    seat: s,
+                    userId: m ? m.userId : 0,
+                    nickname: m ? m.nickname : '（空位）',
+                    offline,
+                    ai: !!(m && m.isAI),
+                    rank: p && p.finished && !p.isEnemy ? p.rank : 0,
+                    left: p ? p.cards.length : 0,
+                });
+                if (offline) offlineSeats.push(s);
+                if (m && m.isAI) aiSeats.push(s);
+            }
+
+            appendRound({
+                ts: new Date(now).toISOString(),
+                at: now,
+                roomId: this.id,
+                roomCode: this.code,
+                roundNo: e.roundNo,
+                hasExchange: e.roundNo > 1,
+                enemySeat: e.enemySeat,
+                enemyWin: !!res.enemyWin,
+                finishOrder: e.finishOrder.slice(),
+                seats,
+                durationSec: this.roundStartedAt ? Math.round((now - this.roundStartedAt) / 1000) : 0,
+                offlineSeats,
+                aiSeats,
+                timeoutSeats: Array.from(this.timeoutSeats),
+            });
+
+            // 重置本局统计
+            this.timeoutSeats.clear();
+            for (const m of this.members) if (m) m.droppedThisRound = false;
+        } catch (err) {
+            console.error(`[房间${this.id}] 落盘对局记录失败:`, err);
+        }
     }
 
     /** 被抓龟挑小牌的顺序（供客户端显示「你排第几」） */
@@ -529,7 +857,7 @@ export class Room {
                         loserPickOrder: this.loserPickOrderView(),
                     });
                 }
-                // 只把操作提示发给本人；不设倒计时——玩家想多久都行，没有自动托管
+                // 只把操作提示发给本人
                 if (m && m.ws && m.ws.readyState === 1) {
                     this.sendTo(step.from, {
                         t: 'turn',
@@ -541,11 +869,16 @@ export class Room {
                         loserPickOrder: this.loserPickOrderView(),
                     });
                 }
+                // 全场倒计时：轮到谁交牌/拿牌，谁开始计时（20 秒）。
+                // 同一步重复 pump 不重置计时，避免"每刷新一次就多给 20 秒"。
+                if (!(this.timerSeat === step.from && this.timer)) {
+                    this.startTimerFor(step.from, this.currentTimeoutSeconds(step.from));
+                }
                 return;
             }
             if (e.phase === Phase.PLAYING) {
                 const m = this.members[e.currentSeat];
-                // 只把出牌提示发给本人；不设倒计时——玩家想多久都行，没有自动托管
+                // 只把出牌提示发给本人
                 if (m && m.ws && m.ws.readyState === 1) {
                     this.sendTo(e.currentSeat, {
                         t: 'turn',
@@ -557,6 +890,10 @@ export class Room {
                         lastSeat: e.lastPlaySeat,
                     });
                 }
+                // 出牌也计时（30 秒），防止一个人发呆全场卡死
+                if (!(this.timerSeat === e.currentSeat && this.timer)) {
+                    this.startTimerFor(e.currentSeat, this.currentTimeoutSeconds(e.currentSeat));
+                }
                 return;
             }
             if (e.phase !== Phase.ROUND_END && e.phase !== Phase.ROUND_WAIT) {
@@ -567,10 +904,18 @@ export class Room {
         console.error(`[房间${this.id}] pump 循环 200 次未收敛 phase=${e.phase} step=${e.currentExchange?.kind}`);
     }
 
-    private clearTimer(): void {
+    /**
+     * 停止倒计时。
+     * 之前有过倒计时才广播 seat:-1（让客户端收起计时环），避免每次推进都多发一条空消息。
+     * silent = 内部换计时时用，不发中间态。
+     */
+    private clearTimer(silent = false): void {
         if (this.timer) { clearTimeout(this.timer); this.timer = null; }
+        const had = this.timerSeat >= 0;
         this.timerSeat = -1;
+        this.timerTotal = 0;
         this.deadline = 0;
+        if (had && !silent) this.broadcast({ t: 'timer', seat: -1 });
     }
 
     /** 房间是否已解散（有人退出且本局已打完 → 全员回匹配） */
@@ -600,6 +945,11 @@ export class Room {
         const need = this.members.filter((m) => !!m).length;
         this.broadcast({ t: 'nextVote', count: this.nextVotes.size, need });
         if (this.nextVotes.size >= need) {
+            // 引擎固定 4 个座位，人不满就开局会卡死 → 等人齐（新玩家加入 ready 后会自然开）
+            if (!this.full()) {
+                this.broadcast({ t: 'tip', msg: `还差 ${SEAT_COUNT - need} 位玩家，人齐后自动开局` });
+                return;
+            }
             this.nextVotes.clear();
             this.startRound();
         }
