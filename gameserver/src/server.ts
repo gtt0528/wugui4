@@ -10,15 +10,21 @@
  *     {t:'join'}                         快速匹配（房间号房间不参与）
  *     {t:'create', nickname?}            开一个带房间号的私有房
  *     {t:'joinCode', code}               用房间号进房
- *     {t:'ready'}                        准备（人齐且全员 ready 自动开局）
+ *     {t:'ready'}                        准备（快速匹配房：人齐且全员 ready 自动开局）
+ *     {t:'startGame'}                    房主手动开局（私有房：满 4 人后由房主点「开始游戏」）
+ *     {t:'dissolve'}                     房主解散房间（广播 roomClosed，其他人回主菜单）
  *     {t:'act', kind:'auto'|'play'|'pass', cards?: number[]}
  *     {t:'next'}                         一局结束后「再来一局」（需全员）
  *     {t:'sync'}                         要一份当前牌局快照（重连/进场景）
  *     {t:'ping'}                         应用层心跳（可选）
  *   服务器 → 客户端：
  *     {t:'loginOk', userId, token, nickname}
- *     {t:'roomOk', roomId, code, seat, members}
- *     {t:'roundStart' | 'hand' | 'turn' | 'played' | 'state' | 'roundEnd' | 'error' | ...}
+ *     {t:'roomOk', roomId, code, isPrivate, ownerSeat, seat, members}
+ *          members 每项含 {seat, userId, nickname, gender, avatar, connected, owner}，
+ *          空位是 {seat, empty:true}。客户端据此画房间等待页。
+ *     {t:'roomClosed', msg}              房间解散（房主解散 / 有人退出 / 房主离开）
+ *     {t:'error', code?, msg}            code 用于机器判断：ROOM_FULL / NO_ROOM / BAD_CODE
+ *     {t:'roundStart' | 'hand' | 'turn' | 'played' | 'state' | 'roundEnd' | 'tip' | ...}
  *
  * 稳定性：
  *   - 服务器每 20 秒 ws.ping()，两轮没回 pong 就 terminate（移动网络下"假活"连接会被清掉）
@@ -210,10 +216,32 @@ function handle(ws: WebSocket, st: ClientState, msg: Record<string, unknown>): v
             if (!st.userId) { ws.send(JSON.stringify({ t: 'error', msg: '请先 login' })); return; }
             if (st.room) { ws.send(JSON.stringify({ t: 'error', msg: '你已在房间里' })); return; }
             const code = String(msg.code || '').trim();
+            if (!/^\d{6}$/.test(code)) {
+                ws.send(JSON.stringify({ t: 'error', code: 'BAD_CODE', msg: '房间号是 6 位数字' }));
+                return;
+            }
             const room = rooms.find((r) => r.code === code && !r.closed);
-            if (!room) { ws.send(JSON.stringify({ t: 'error', msg: '房间号不存在或已解散' })); return; }
-            if (room.full()) { ws.send(JSON.stringify({ t: 'error', msg: '房间已满' })); return; }
+            if (!room) {
+                ws.send(JSON.stringify({ t: 'error', code: 'NO_ROOM', msg: '房间号不存在或已解散' }));
+                return;
+            }
+            if (room.full()) {
+                ws.send(JSON.stringify({ t: 'error', code: 'ROOM_FULL', msg: '房间已满' }));
+                return;
+            }
             enterRoom(ws, st, room);
+            return;
+        }
+        case 'startGame': {
+            if (!st.room) { ws.send(JSON.stringify({ t: 'error', msg: '你不在任何房间里' })); return; }
+            st.room.startGame(st.seat);
+            return;
+        }
+        case 'dissolve': {
+            if (!st.room) { ws.send(JSON.stringify({ t: 'error', msg: '你不在任何房间里' })); return; }
+            const room = st.room;
+            room.dissolveBy(st.seat);
+            destroyIfDone(room);
             return;
         }
         case 'ready': {
@@ -265,11 +293,20 @@ function handle(ws: WebSocket, st: ClientState, msg: Record<string, unknown>): v
 /** 进房 + 下发 roomOk + 广播成员变化（join / create / joinCode 共用） */
 function enterRoom(ws: WebSocket, st: ClientState, room: Room): void {
     const seat = room.join(st.userId, st.nickname, ws, st.gender, st.avatar);
-    if (seat === null) { ws.send(JSON.stringify({ t: 'error', msg: '房间满了' })); return; }
+    if (seat === null) {
+        ws.send(JSON.stringify({ t: 'error', code: 'ROOM_FULL', msg: '房间已满' }));
+        return;
+    }
     st.room = room;
     st.seat = seat;
     ws.send(JSON.stringify({
-        t: 'roomOk', roomId: room.id, code: room.code, seat, members: room.membersView(),
+        t: 'roomOk',
+        roomId: room.id,
+        code: room.code,
+        isPrivate: room.isPrivate,
+        ownerSeat: room.ownerSeat,
+        seat,
+        members: room.membersView(),
     }));
     room.broadcast({ t: 'memberUpdate', members: room.membersView() });
 }

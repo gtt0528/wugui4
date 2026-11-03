@@ -14,6 +14,7 @@ import {
 import { NetClient } from '../net/NetClient';
 import { setupShare, share, launchQuery, showRewardedAd, isWechat } from '../net/WxAdapter';
 import { serverCfg, prodNotConfigured } from '../net/Config';
+import { RoomWaitView, RoomViewState } from './RoomWaitView';
 
 const { ccclass } = cc._decorator;
 
@@ -33,6 +34,9 @@ export default class MenuScene extends cc.Component {
 
     private layerMain: cc.Node = null!;
     private layerPop: cc.Node = null!;
+    /** 房间等待页（创建/加入房间后停留在这里，褐色基调） */
+    private layerRoom: cc.Node = null!;
+    private roomView: RoomWaitView = null!;
     private lblScore: cc.Label = null!;
     private lblStats: cc.Label = null!;
 
@@ -43,6 +47,7 @@ export default class MenuScene extends cc.Component {
         this.buildTopBar();
         this.buildModes();
         this.buildFooter();
+        this.buildRoomWait();
         this.refreshProfile();
 
         // 转发文案：带上房间号，好友点开卡片能直接进同一个房间
@@ -87,6 +92,10 @@ export default class MenuScene extends cc.Component {
         g.circle(0, 60, 260);
         g.fillColor = cc.color(60, 150, 105, 40);
         g.fill();
+
+        this.layerRoom = new cc.Node('room');
+        this.layerRoom.parent = this.node;
+        this.layerRoom.zIndex = 50;
 
         this.layerPop = new cc.Node('pop');
         this.layerPop.parent = this.node;
@@ -168,14 +177,15 @@ export default class MenuScene extends cc.Component {
 
     private buildModes(): void {
         const modes: ModeDef[] = [
-            { key: 'match', title: '开始匹配', desc: '和线上玩家凑一桌\n最多等 30 秒，人不够由机器人补位', enabled: true },
-            { key: 'room', title: '创建房间', desc: '生成 6 位房间号\n微信发给好友一起打', enabled: true },
+            { key: 'match', title: '开始匹配', desc: '和线上玩家凑一桌\n30 秒不满由机器人补位', enabled: true },
+            { key: 'create', title: '创建房间', desc: '生成 6 位房间号\n微信发给好友一起打', enabled: true },
+            { key: 'join', title: '加入房间', desc: '输入好友的房间号\n直接进同一桌', enabled: true },
             { key: 'ai', title: '人机对战', desc: '1 人 + 3 个 AI\n不用联网也能玩', enabled: true },
         ];
 
-        const cardW = 300;
+        const cardW = 280;
         const cardH = 190;
-        const gap = 40;
+        const gap = 24;
         const totalW = cardW * modes.length + gap * (modes.length - 1);
         let x = -totalW / 2 + cardW / 2;
 
@@ -203,19 +213,24 @@ export default class MenuScene extends cc.Component {
         g.lineWidth = 2;
         g.stroke();
 
-        const t = createLabel(m.title, 32, m.enabled ? cc.color(255, 230, 150) : cc.color(170, 180, 176), 0, 40);
+        // 标题 y=50（32px，占 34~66），描述 y=-10（16px 两行，占 -34~14），
+        // 按钮 y=-68（42 高，占 -89~-47）—— 三段不重叠，留 16~20px 间隙
+        const t = createLabel(m.title, 32, m.enabled ? cc.color(255, 230, 150) : cc.color(170, 180, 176), 0, 50);
         t.parent = n;
         t.getComponent(cc.Label)!.horizontalAlign = cc.Label.HorizontalAlign.CENTER;
 
-        const d = createMultiline(m.desc, 18, m.enabled ? cc.color(200, 235, 210) : cc.color(145, 155, 150), 0, 2, w - 40);
+        const d = createMultiline(m.desc, 16,
+            m.enabled ? cc.color(200, 235, 210) : cc.color(145, 155, 150), 0, -10, w - 36);
         d.parent = n;
+        const dl = d.getComponent(cc.Label)!;
+        dl.lineHeight = 24;
 
         const btn = createButton(m.enabled ? '进入' : '敬请期待', {
             fill: m.enabled ? cc.color(226, 150, 50) : cc.color(74, 84, 80),
-            fontSize: 20, width: 128, height: 42,
+            fontSize: 20, width: 122, height: 42,
         }, () => this.onModeClick(m));
         btn.parent = n;
-        btn.setPosition(0, -h / 2 + 30);
+        btn.setPosition(0, -68);
 
         return n;
     }
@@ -223,7 +238,8 @@ export default class MenuScene extends cc.Component {
     private onModeClick(m: ModeDef): void {
         if (m.key === 'ai') { this.startAIGame(); return; }
         if (m.key === 'match') { this.startOnline('match'); return; }
-        if (m.key === 'room') { this.startOnline('create'); return; }
+        if (m.key === 'create') { this.startOnline('create'); return; }
+        if (m.key === 'join') { this.showJoinPanel(); return; }
         this.showToast('该模式暂未开放');
     }
 
@@ -237,6 +253,11 @@ export default class MenuScene extends cc.Component {
     private inviteBtnNode: cc.Node | null = null;
     private pendingMode: 'match' | 'create' | 'join' = 'match';
     private pendingCode = '';
+    /** 房间等待页的最新状态（成员变化时整体刷新） */
+    private roomState: RoomViewState | null = null;
+    /** 「加入房间」数字键盘当前输入 */
+    private joinCodeInput = '';
+    private joinCellLbls: cc.Label[] = [];
 
     /**
      * 联机入口：连服 → 登录 → （快速匹配 / 开房 / 按房间号进）。
@@ -244,6 +265,8 @@ export default class MenuScene extends cc.Component {
     private startOnline(mode: 'match' | 'create' | 'join', code = ''): void {
         const net = NetClient.inst;
         if (net.connected) {
+            // 已连着（比如刚从牌局退回）：重新挂上回调再发指令，否则消息没人接
+            net.onMsg = (msg) => this.onMatchMsg(msg, net);
             if (mode === 'create') net.create();
             else if (mode === 'join') net.joinCode(code);
             else net.join();
@@ -284,38 +307,84 @@ export default class MenuScene extends cc.Component {
                 else if (this.pendingMode === 'join') net.joinCode(this.pendingCode);
                 else net.join();
                 break;
-            case 'roomOk':
+            case 'roomOk': {
                 net.mySeat = msg.seat;
                 net.roomId = msg.roomId;
                 this.myCode = msg.code ? String(msg.code) : '';
-                this.onlineCount = msg.members ? msg.members.filter((m: any) => !m.empty).length : 1;
-                // 进房即自动准备：4 家都进房且都准备了，服务器自动开局
-                net.ready();
-                this.refreshInvite();
-                this.setMatchStatus(
-                    this.myCode
-                        ? `房间 ${this.myCode} · 你是 ${msg.seat + 1} 号位\n把房间号发给好友，人齐自动开局`
-                        : `已进房（${msg.seat + 1} 号位），已自动准备\n还差 ${4 - this.onlineCount} 位玩家，30 秒内不够会由机器人补位`);
+                const members: any[] = msg.members || [];
+                const count = members.filter((m) => !m.empty).length;
+                this.onlineCount = count;
+                this.roomState = {
+                    code: this.myCode || net.roomId,
+                    mySeat: msg.seat,
+                    members,
+                    count,
+                    need: 4,
+                    isPrivate: !!msg.isPrivate,
+                };
+                this.clearPop();                       // 关掉「正在连接…」面板
+                if (msg.isPrivate) {
+                    // 私有房（创建/加入）：停在褐色房间等待页，等房主开局
+                    this.openRoomView(this.roomState);
+                } else {
+                    // 快速匹配：保持原流程（人齐自动开局，30 秒不满机器人补位）
+                    // 公开房不记房间号，界面上就不显示「邀请好友」了
+                    this.myCode = '';
+                    this.roomState = null;
+                    net.ready();
+                    this.setMatchStatus(
+                        `已进房（${msg.seat + 1} 号位），已自动准备\n还差 ${4 - count} 人，30 秒内不够会由机器人补位`);
+                }
                 break;
-            case 'readyCount':
-                this.setMatchStatus(`房间 ${this.myCode || net.roomId} · ${this.onlineCount}/4 人 · 准备 ${msg.ready}/${msg.need}`);
-                break;
+            }
             case 'memberUpdate': {
                 const list: any[] = msg.members || [];
                 this.onlineCount = list.filter((m) => !m.empty).length;
-                if (!this.myCode) this.setMatchStatus(`房间 ${net.roomId} · ${this.onlineCount}/4 人，人齐后自动开局`);
+                if (this.roomState) {
+                    this.roomState.members = list;
+                    this.roomState.count = this.onlineCount;
+                    this.roomView.update(this.roomState);
+                }
+                if (!this.myCode) {
+                    this.setMatchStatus(`房间 ${net.roomId} · ${this.onlineCount}/4 人，人齐后自动开局`);
+                }
                 break;
             }
+            case 'readyCount':
+                if (!this.roomState) {
+                    this.setMatchStatus(`房间 ${this.myCode || net.roomId} · ${this.onlineCount}/4 人 · 准备 ${msg.ready}/${msg.need}`);
+                }
+                break;
             case 'roundStart':
                 // 牌局开始：进 game 场景，GameScene 检测到连接会自动切联机视图
                 net.onMsg = null;
+                this.roomState = null;
+                if (this.roomView) this.roomView.hide();
                 cc.director.loadScene('game', (err) => {
                     if (err) cc.error('[乌龟4] 进入联机牌局失败', err);
                 });
                 break;
-            case 'error':
-                this.setMatchStatus('服务器：' + (msg.msg || '未知错误'));
+            case 'roomClosed':
+                // 房主解散 / 有人退出 / 房主离开 → 回主菜单
+                net.roomCode = '';
+                net.roomId = '';
+                net.mySeat = -1;
+                this.leaveRoomUi();
+                this.showToast(msg.msg || '房间已解散');
                 break;
+            case 'error': {
+                const text = msg.msg || '未知错误';
+                if (msg.code === 'ROOM_FULL' || msg.code === 'NO_ROOM' || msg.code === 'BAD_CODE') {
+                    // 加入失败：断开这条连接，回到干净的主菜单，并给出明确原因
+                    net.close();
+                    this.clearPop();
+                    this.showToast(text);
+                    return;
+                }
+                if (this.roomView && this.roomView.visible) { this.showToast(text); return; }
+                this.setMatchStatus('服务器：' + text);
+                break;
+            }
             default:
                 break;
         }
@@ -379,6 +448,187 @@ export default class MenuScene extends cc.Component {
     private setMatchStatus(text: string): void {
         if (!this.matchStatus || !this.matchStatus.isValid) { this.showMatchPanel(text); return; }
         this.matchStatus.string = text;
+    }
+
+    // ================= 房间等待页 =================
+
+    private buildRoomWait(): void {
+        this.roomView = new RoomWaitView(this.layerRoom, {
+            onStart: () => NetClient.inst.startGame(),
+            onDissolve: () => this.confirmRoomAction(
+                '解散房间',
+                '房间会在所有人那里关闭，\n他们就都得重新进房了。确定解散？',
+                () => NetClient.inst.dissolve()),
+            onLeave: () => this.confirmRoomAction(
+                '退出房间',
+                '退出后要重新输房间号才能回来。\n如果你房主，房主会交给下一个人。确定退出？',
+                () => {
+                    NetClient.inst.close();
+                    this.leaveRoomUi();
+                }),
+            onCopy: () => this.copyInviteLink(),
+            onTip: (msg) => this.showToast(msg),
+        });
+    }
+
+    private openRoomView(st: RoomViewState): void {
+        if (!this.roomView) return;
+        this.layerMain.active = false;
+        this.roomView.show(st);
+    }
+
+    /** 关闭房间页，回主菜单（解散/被解散/退出时用） */
+    private leaveRoomUi(): void {
+        this.roomState = null;
+        this.myCode = '';
+        if (this.roomView) this.roomView.hide();
+        if (this.layerMain) this.layerMain.active = true;
+    }
+
+    /** 通用二次确认（房间页的解散/退出都用它，防误点） */
+    private confirmRoomAction(title: string, msg: string, onYes: () => void): void {
+        this.clearPop();
+        const p = createPanel(580, 300, cc.color(46, 33, 24, 252), cc.color(150, 116, 78), 16);
+        p.parent = this.layerPop;
+
+        const t = createLabel(title, 28, cc.color(240, 205, 140), 0, 96);
+        t.parent = p;
+
+        const m = createMultiline(msg, 19, cc.color(232, 218, 196), 0, 32, 500);
+        m.parent = p;
+
+        const yes = createButton('确定', {
+            fill: cc.color(150, 66, 52), textColor: cc.color(255, 240, 232),
+            fontSize: 22, width: 170, height: 56,
+        }, () => { this.clearPop(); onYes(); });
+        yes.parent = p;
+        yes.setPosition(-100, -86);
+
+        const no = createButton('取消', {
+            fill: cc.color(96, 78, 60), textColor: cc.color(240, 226, 200),
+            fontSize: 22, width: 170, height: 56,
+        }, () => this.clearPop());
+        no.parent = p;
+        no.setPosition(100, -86);
+    }
+
+    /** 复制带房间号的邀请链接（同一台电脑开多个标签页自测时最省事） */
+    private copyInviteLink(): void {
+        const code = this.myCode;
+        if (!code) return;
+        let link = '';
+        try {
+            if (typeof location !== 'undefined') {
+                link = `${location.origin}${location.pathname}?code=${code}`;
+            }
+        } catch (e) { /* 忽略 */ }
+        const text = link || code;
+
+        let ok = false;
+        try {
+            if (typeof document !== 'undefined') {
+                const ta = document.createElement('textarea');
+                ta.value = text;
+                ta.style.position = 'fixed';
+                ta.style.opacity = '0';
+                document.body.appendChild(ta);
+                ta.select();
+                ok = document.execCommand('copy');
+                document.body.removeChild(ta);
+            }
+        } catch (e) { ok = false; }
+
+        if (ok) {
+            this.showToast('邀请链接已复制\n在新标签页粘一下，就是另一个玩家');
+        } else {
+            this.showToast(`房间号 ${code}\n浏览器地址后面加 ?code=${code} 也能直接进`);
+        }
+    }
+
+    // ================= 加入房间：数字键盘 =================
+
+    private showJoinPanel(): void {
+        this.clearPop();
+        this.joinCodeInput = '';
+        this.joinCellLbls = [];
+
+        const p = createPanel(660, 600, cc.color(62, 46, 32, 252), cc.color(150, 116, 78), 20);
+        p.parent = this.layerPop;
+
+        const title = createLabel('输入房间号', 30, cc.color(240, 205, 140), 0, 250);
+        title.parent = p;
+
+        const tip = createLabel('6 位数字，问一下开房的朋友', 17, cc.color(176, 150, 118), 0, 214);
+        tip.parent = p;
+
+        // 6 个数字格
+        const cellW = 64;
+        const cellGap = 12;
+        const cellsW = cellW * 6 + cellGap * 5;
+        for (let i = 0; i < 6; i++) {
+            const cx = -cellsW / 2 + cellW / 2 + i * (cellW + cellGap);
+            const cell = createPanel(cellW, 76, cc.color(48, 36, 25), cc.color(120, 92, 64), 10);
+            cell.parent = p;
+            cell.setPosition(cx, 150);
+            const l = createLabel('', 34, cc.color(255, 226, 150), cx, 150);
+            l.parent = p;
+            this.joinCellLbls.push(l.getComponent(cc.Label)!);
+        }
+
+        // 3 × 4 数字键盘
+        const keys = ['1', '2', '3', '4', '5', '6', '7', '8', '9', '删', '0', '清'];
+        const bw = 120;
+        const bh = 62;
+        const bGapX = 20;
+        const bGapY = 12;
+        const startX = -(bw * 3 + bGapX * 2) / 2 + bw / 2;
+        const startY = 92;
+        keys.forEach((k, i) => {
+            const col = i % 3;
+            const row = Math.floor(i / 3);
+            const isFn = (k === '删' || k === '清');
+            const btn = createButton(k, {
+                fill: isFn ? cc.color(96, 74, 56) : cc.color(120, 92, 64),
+                textColor: cc.color(246, 232, 206),
+                fontSize: isFn ? 22 : 28, width: bw, height: bh,
+            }, () => this.onJoinKey(k));
+            btn.parent = p;
+            btn.setPosition(startX + col * (bw + bGapX), startY - row * (bh + bGapY));
+        });
+
+        const join = createButton('加入', {
+            fill: cc.color(226, 150, 50), fontSize: 24, width: 190, height: 58,
+        }, () => this.submitJoin());
+        join.parent = p;
+        join.setPosition(-110, -250);
+
+        const cancel = createButton('取消', {
+            fill: cc.color(96, 78, 60), textColor: cc.color(240, 226, 200),
+            fontSize: 24, width: 160, height: 58,
+        }, () => this.clearPop());
+        cancel.parent = p;
+        cancel.setPosition(110, -250);
+    }
+
+    private onJoinKey(k: string): void {
+        if (k === '删') this.joinCodeInput = this.joinCodeInput.slice(0, -1);
+        else if (k === '清') this.joinCodeInput = '';
+        else if (this.joinCodeInput.length < 6) this.joinCodeInput += k;
+
+        for (let i = 0; i < this.joinCellLbls.length; i++) {
+            const l = this.joinCellLbls[i];
+            if (l && l.isValid) l.string = this.joinCodeInput[i] || '';
+        }
+    }
+
+    private submitJoin(): void {
+        if (this.joinCodeInput.length !== 6) {
+            this.showToast('房间号是 6 位数字');
+            return;
+        }
+        const code = this.joinCodeInput;
+        this.clearPop();
+        this.startOnline('join', code);
     }
 
     /** 浏览器预览时支持 ?code=123456 直接进房（方便自己开两个窗口测试） */

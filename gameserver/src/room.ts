@@ -53,6 +53,12 @@ export class Room {
     code: string;
     /** 是否是「创建房间」开的私有房（不参与快速匹配） */
     isPrivate = false;
+    /**
+     * 房主座位（-1 = 还没人）。
+     * 私有房由房主点「开始游戏 / 解散房间」；房主主动退出或掉线被清时，
+     * 按座位号顺序移交给下一个有人的座位，房间不会因为房主走了就废掉。
+     */
+    ownerSeat = -1;
     members: (Member | null)[] = [null, null, null, null];
     engine: GameEngine;
     readyFlags = new Set<number>();   // 每个座位都 ready 才能开局，防止重复 startRound
@@ -132,6 +138,8 @@ export class Room {
         }
 
         this.members[seat] = { seat, userId, nickname: nick, gender, avatar, ws };
+        // 第一个进房的人当房主；房主走后由 leave 路径移交
+        if (this.ownerSeat < 0) this.ownerSeat = seat;
         return seat;
     }
 
@@ -177,7 +185,8 @@ export class Room {
         if (this.engine.roundNo > 0 && !this.closed) {
             this.dissolve('有玩家退出了游戏，房间解散，请重新匹配');
         } else if (this.engine.roundNo === 0) {
-            // 还没打过任何一局：只广播成员变化，凑新人
+            // 还没打过任何一局：房主走了先移交，再广播成员变化，凑新人
+            this.transferOwner();
             this.broadcast({ t: 'memberUpdate', members: this.membersView() });
             this.broadcast({ t: 'readyCount', ready: this.readyFlags.size, need: SEAT_COUNT });
         }
@@ -203,10 +212,15 @@ export class Room {
         this.readyFlags.delete(seat);
         this.retractNextVote(seat);
         this.clearTimer();
-        this.broadcast({ t: 'memberUpdate', members: this.membersView() });
         if (this.engine.roundNo > 0 && !this.closed) {
+            this.broadcast({ t: 'memberUpdate', members: this.membersView() });
             this.dissolve(`${m.nickname} 退出了游戏，房间解散，请重新匹配`);
-        } else if (this.isEmpty()) {
+            return;
+        }
+        // 等开局的阶段：房主退出不能让房间废掉，移交给下一个有人的座位
+        this.transferOwner();
+        this.broadcast({ t: 'memberUpdate', members: this.membersView() });
+        if (this.isEmpty()) {
             this.dissolve('玩家都离开了');
         } else {
             this.broadcast({ t: 'readyCount', ready: this.readyFlags.size, need: SEAT_COUNT });
@@ -224,6 +238,7 @@ export class Room {
         if (!changed) return;
         // 局末清理：把真没回来的（以及 AI 补位）请出房间，但**不解散**。
         // 剩下的人等着重连或新人补位，比被踢回匹配界面好得多。
+        this.transferOwner();
         this.broadcast({ t: 'memberUpdate', members: this.membersView() });
         this.broadcast({ t: 'readyCount', ready: this.readyFlags.size, need: SEAT_COUNT });
         if (this.isEmpty()) this.dissolve('玩家都离开了');
@@ -271,8 +286,30 @@ export class Room {
 
     membersView(): object[] {
         return this.members.map((m, s) => m
-            ? { seat: m.seat, userId: m.userId, nickname: m.nickname, gender: m.gender, avatar: m.avatar, connected: !!m.ws, ai: !!m.isAI }
-            : { seat: s, empty: true });
+            ? {
+                seat: m.seat, userId: m.userId, nickname: m.nickname, gender: m.gender,
+                avatar: m.avatar, connected: !!m.ws, ai: !!m.isAI, owner: s === this.ownerSeat,
+            }
+            : { seat: s, empty: true, owner: false });
+    }
+
+    /**
+     * 房主位空了（退出 / 掉线被清）→ 按座位号顺序移交给下一个有人的座位。
+     * 只在「还没开局」时移交；牌局中缺人会直接解散，不会走到这里。
+     */
+    private transferOwner(): void {
+        if (this.ownerSeat >= 0 && this.members[this.ownerSeat]) return;
+        const from = this.ownerSeat >= 0 ? this.ownerSeat : -1;
+        for (let i = 1; i <= SEAT_COUNT; i++) {
+            const s = (from + i + SEAT_COUNT) % SEAT_COUNT;
+            const m = this.members[s];
+            if (m) {
+                this.ownerSeat = s;
+                this.broadcast({ t: 'tip', msg: `${m.nickname} 成为新房主` });
+                return;
+            }
+        }
+        this.ownerSeat = -1;
     }
 
     /** 各家排名（1=导游 2=中游 3=尾游，0=未出完/敌人），供客户端在头像旁标身份 */
@@ -318,11 +355,40 @@ export class Room {
     markReady(seat: number): boolean {
         this.readyFlags.add(seat);
         this.broadcast({ t: 'readyCount', ready: this.readyFlags.size, need: SEAT_COUNT });
-        if (this.full() && this.readyFlags.size >= SEAT_COUNT) {
+        // 私有房（有房间号）不自动开：房主看着人齐了自己点「开始游戏」，避免有人还在看规则就被发牌
+        if (this.full() && this.readyFlags.size >= SEAT_COUNT && !this.isPrivate) {
             this.startRound();
             return true;
         }
         return false;
+    }
+
+    /** 房主点「开始游戏」：必须是房主、必须满 4 人、不能在牌局中 */
+    startGame(seat: number): boolean {
+        if (this.closed) return false;
+        if (seat !== this.ownerSeat) {
+            this.sendTo(seat, { t: 'error', msg: '只有房主可以开始游戏' });
+            return false;
+        }
+        if (this.inRound()) return false;
+        if (!this.full()) {
+            this.sendTo(seat, { t: 'error', msg: `还差 ${SEAT_COUNT - this.humanCount()} 人，满 4 人才能开始` });
+            return false;
+        }
+        console.log(`[房间${this.id}] 房主开局，${this.humanCount()} 人`);
+        this.startRound();
+        return true;
+    }
+
+    /** 房主解散房间：广播 roomClosed，所有人回主菜单 */
+    dissolveBy(seat: number): boolean {
+        if (this.closed) return false;
+        if (seat !== this.ownerSeat) {
+            this.sendTo(seat, { t: 'error', msg: '只有房主可以解散房间' });
+            return false;
+        }
+        this.dissolve('房主解散了房间');
+        return true;
     }
 
     /**

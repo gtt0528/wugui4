@@ -24,6 +24,23 @@ export type MsgHandler = (msg: ServerMsg) => void;
 
 /** 身份（服务器签发）存档 key */
 const ID_KEY = 'wugui4.identity.v1';
+
+/**
+ * 身份存在哪 —— 这里决定了「一台电脑能开几个玩家」。
+ *
+ * localStorage 是**同源全局共享**的：同一浏览器的 4 个标签页会读到同一个 userId+token，
+ * 服务器认为这 4 条连接是同一个人重连，只给一个座位 —— 想开 4 个网页自测是永远凑不齐的。
+ * sessionStorage 按标签页隔离、刷新保留、关标签即清，正好符合"每个网页一个玩家"。
+ * 微信小游戏没有 sessionStorage（一台设备就是一个玩家），退回 localStorage。
+ */
+function identityStore(): { getItem(k: string): string | null; setItem(k: string, v: string): void } {
+    try {
+        if (typeof sessionStorage !== 'undefined' && sessionStorage) {
+            return sessionStorage as unknown as { getItem(k: string): string | null; setItem(k: string, v: string): void };
+        }
+    } catch (e) { /* 隐私模式下访问可能抛错，退回 localStorage */ }
+    return cc.sys.localStorage as unknown as { getItem(k: string): string | null; setItem(k: string, v: string): void };
+}
 /** 心跳间隔与判定断线的静默时长（ms） */
 const HB_INTERVAL = 15000;
 const HB_SILENCE = 45000;
@@ -70,7 +87,7 @@ export class NetClient {
 
     private loadIdentity(): Identity | null {
         try {
-            const raw = cc.sys.localStorage.getItem(ID_KEY);
+            const raw = identityStore().getItem(ID_KEY);
             if (!raw) return null;
             const obj = JSON.parse(raw);
             if (obj && typeof obj.userId === 'number' && typeof obj.token === 'string') return obj;
@@ -81,7 +98,7 @@ export class NetClient {
     private saveIdentity(id: Identity): void {
         this.userId = id.userId;
         this.token = id.token;
-        try { cc.sys.localStorage.setItem(ID_KEY, JSON.stringify(id)); } catch (e) { /* 忽略 */ }
+        try { identityStore().setItem(ID_KEY, JSON.stringify(id)); } catch (e) { /* 忽略 */ }
     }
 
     // ================= 连接 =================
@@ -257,9 +274,19 @@ export class NetClient {
         this.send({ t: 'joinCode', code });
     }
 
-    /** 准备开局 */
+    /** 准备开局（快速匹配房用；私有房由房主手动开局） */
     ready(): void {
         this.send({ t: 'ready' });
+    }
+
+    /** 房主手动开局（私有房：人齐后由房主触发） */
+    startGame(): void {
+        this.send({ t: 'startGame' });
+    }
+
+    /** 房主解散房间 */
+    dissolve(): void {
+        this.send({ t: 'dissolve' });
     }
 
     /** 提交动作：出牌 / 跳过 / 交牌 / 托管 */

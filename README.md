@@ -358,8 +358,13 @@ cd gameserver && npm run smoke
 
 ### 协议摘要（gameserver）
 
-- 客户端：`login`（带 `userId`+`token` 表示重连）→ `join` / `create` / `joinCode` → `ready` → `act`（play/pass/auto）→ `next`；主动退出发 `leave`；心跳 `ping`
-- 服务器：`loginOk`（**签发 userId+token**）/ `roomOk`（含 6 位房间号 `code`）/ `roundStart` / `hand`（私密手牌）/ `turn` / `exTurn` / `ex` / `timer` / `played` / `state` / `roundEnd` / `tip` / `roomClosed` / `error`
+- 客户端：`login`（带 `userId`+`token` 表示重连）→ `join` / `create` / `joinCode` → `ready` → `act`（play/pass/auto）→ `next`；房主 `startGame` / `dissolve`；主动退出发 `leave`；心跳 `ping`
+- 服务器：`loginOk`（**签发 userId+token**）/ `roomOk`（含 6 位房间号 `code`、`isPrivate`、`ownerSeat`）/ `roundStart` / `hand`（私密手牌）/ `turn` / `exTurn` / `ex` / `timer` / `played` / `state` / `roundEnd` / `tip` / `roomClosed` / `error`
+- **私有房（创建/加入）**：进房后停在褐色房间等待页，`members` 每项含 `{seat, nickname, gender, avatar, connected, owner}`，空位是 `{seat, empty:true}`。
+  房主点「开始游戏」才发牌；房主可「解散房间」；房主主动退出时按座位号顺序把房主移交给下一个人，房间不解散。
+  第 5 个人用同一房间号进房 → `{t:'error', code:'ROOM_FULL', msg:'房间已满'}`。
+- **同一台电脑开多个网页自测**：身份存在 `sessionStorage`（按标签页隔离），4 个标签就是 4 个独立玩家；
+  用「创建房间」拿房间号，其余标签用「加入房间」输号，或用 `?code=123456` 直接打开。
 - **掉线重连**：服务器签发 userId+token，同身份重连自动坐回原位并 `sync` 拉牌局快照。
   牌局中掉线**不再解散房间**，座位保留、由超时托管继续打；只有明确发 `leave`（点「退出游戏」）才算主动退出
 - **回合计时**：交牌每步 20 秒、出牌 20 秒，超时按「系统建议」自动执行
