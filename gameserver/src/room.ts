@@ -42,9 +42,23 @@ export interface Member {
 let roomSeq = 1;
 let codeSeq = 100000;
 
-/** 生成 6 位房间号（递增，保证同一进程内不重复） */
+/** 已发出去的房间号，保证同一进程内不重复 */
+const usedCodes = new Set<string>();
+
+/**
+ * 生成 6 位房间号。
+ * 用随机而不是递增：递增的号（100001、100002…）别人能猜着号乱进别人房间。
+ */
 export function makeRoomCode(): string {
-    return String(codeSeq++);
+    for (let i = 0; i < 60; i++) {
+        const c = String(100000 + Math.floor(Math.random() * 900000));
+        if (!usedCodes.has(c)) { usedCodes.add(c); return c; }
+    }
+    // 极端兜底：随机连续撞号（几乎不可能），退回递增
+    let c = String(codeSeq++);
+    while (usedCodes.has(c)) c = String(codeSeq++);
+    usedCodes.add(c);
+    return c;
 }
 
 export class Room {
