@@ -7,7 +7,8 @@
     "build": "tsc -p tsconfig.json",
     "start": "node dist/gameserver/src/server.js",
     "smoke": "node test/smoke.js",
-    "roomtest": "node test/roomtest.js"
+    "roomtest": "node test/roomtest.js",
+    "report": "node tools/report.js"
   },
   "dependencies": {
     "ws": "^8.18.0"

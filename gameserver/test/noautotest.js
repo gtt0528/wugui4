@@ -8,7 +8,7 @@
  *   ③ 逐步点完整个交牌过程，验证每一步都由「客户端发送 act」触发
  */
 const WebSocket = require('ws');
-const URL = 'ws://localhost:8090';
+const URL = process.env.WS_URL || 'ws://localhost:8090';
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
 class Bot {

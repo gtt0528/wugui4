@@ -53,6 +53,7 @@ Thumbs.db
 backend/target/
 gameserver/dist/
 gameserver/logs/
+gameserver/data/
 gameserver/.npmlog
 .testout/
 

@@ -8,7 +8,7 @@
  *   4. 全程监听 ranks（导游/中游/尾游）与 enemyRevealed，检查身份标注时机
  */
 const WebSocket = require('ws');
-const URL = 'ws://localhost:8090';
+const URL = process.env.WS_URL || 'ws://localhost:8090';
 
 
 const PLAYER_COUNT = 4;

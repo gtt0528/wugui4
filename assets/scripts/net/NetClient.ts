@@ -24,6 +24,8 @@ export type MsgHandler = (msg: ServerMsg) => void;
 
 /** 身份（服务器签发）存档 key */
 const ID_KEY = 'wugui4.identity.v1';
+/** 玩家持久设备号存档 key（跨服务重启不变，用来算跨天留存） */
+const PLAYER_ID_KEY = 'wugui4.playerId.v1';
 
 /**
  * 身份存在哪 —— 这里决定了「一台电脑能开几个玩家」。
@@ -33,7 +35,7 @@ const ID_KEY = 'wugui4.identity.v1';
  * sessionStorage 按标签页隔离、刷新保留、关标签即清，正好符合"每个网页一个玩家"。
  * 微信小游戏没有 sessionStorage（一台设备就是一个玩家），退回 localStorage。
  */
-function identityStore(): { getItem(k: string): string | null; setItem(k: string, v: string): void } {
+export function identityStore(): { getItem(k: string): string | null; setItem(k: string, v: string): void } {
     try {
         if (typeof sessionStorage !== 'undefined' && sessionStorage) {
             return sessionStorage as unknown as { getItem(k: string): string | null; setItem(k: string, v: string): void };
@@ -99,6 +101,32 @@ export class NetClient {
         this.userId = id.userId;
         this.token = id.token;
         try { identityStore().setItem(ID_KEY, JSON.stringify(id)); } catch (e) { /* 忽略 */ }
+    }
+
+    /**
+     * 持久设备号：首次进入生成一次，之后一直沿用。
+     *
+     * 为什么需要它：服务器的 userId 是服务器发的，早期的实现存在内存里、重启就从头
+     * 编号——同一个真人第二天再来会变成另一个人，跨天留存算不出来。这个号存在玩家
+     * 设备上，重启服务、换进程都不影响，服务端据此把老玩家认回来。
+     *
+     * 存在同一个 store 里：微信小游戏 = localStorage（一台设备一个玩家）；
+     * 浏览器 = sessionStorage（一个标签页一个玩家，方便一台电脑开 4 个网页自测）。
+     */
+    playerId = '';
+
+    private ensurePlayerId(): string {
+        if (this.playerId) return this.playerId;
+        try {
+            const saved = identityStore().getItem(PLAYER_ID_KEY);
+            if (saved && saved.length >= 8) { this.playerId = saved; return saved; }
+        } catch (e) { /* 忽略 */ }
+        // 不依赖 crypto.randomUUID（老 webview / 微信基础库不一定有），自己拼一个够用的
+        const rand = () => Math.random().toString(36).slice(2, 10);
+        const id = 'p' + Date.now().toString(36) + '-' + rand() + rand();
+        this.playerId = id;
+        try { identityStore().setItem(PLAYER_ID_KEY, id); } catch (e) { /* 忽略 */ }
+        return id;
     }
 
     // ================= 连接 =================
@@ -254,7 +282,7 @@ export class NetClient {
         this.gender = gender;
         this.avatar = avatar;
         const id = this.loadIdentity();
-        const msg: ServerMsg = { t: 'login', nickname, gender, avatar };
+        const msg: ServerMsg = { t: 'login', nickname, gender, avatar, playerId: this.ensurePlayerId() };
         if (id) { msg.userId = id.userId; msg.token = id.token; }
         this.send(msg);
     }

@@ -27,6 +27,8 @@ export const AUTO_PILOT_AFTER = 2;
 export interface Member {
     seat: number;
     userId: number;
+    /** 客户端持久设备号（跨服务重启稳定），落盘统计用；匿名/测试连接为空 */
+    playerId: string;
     nickname: string;
     gender: number;                 // 0 未知 1 男 2 女
     avatar: string;                 // 头像 URL（微信头像 / 默认头像标识），可为空
@@ -117,7 +119,7 @@ export class Room {
     }
 
     /** 返回 null=加入失败，否则返回分配的座位 */
-    join(userId: number, nickname: string, ws: WebSocket, gender = 0, avatar = ''): number | null {
+    join(userId: number, nickname: string, ws: WebSocket, gender = 0, avatar = '', playerId = ''): number | null {
         // 房间从空变为有人 → 重新开始计算"等凑人"的时间
         if (this.isEmpty()) this.waitSince = Date.now();
         // 重连：同一 userId 优先坐回原位（牌局进行中也保留座位）
@@ -129,6 +131,7 @@ export class Room {
                 m.nickname = nickname;
                 m.gender = gender;
                 m.avatar = avatar;
+                if (playerId) m.playerId = playerId;
                 m.offlineAt = undefined;
                 if (back) {
                     this.broadcast({ t: 'memberUpdate', members: this.membersView() });
@@ -151,7 +154,7 @@ export class Room {
             nick = `${nick}#${i}`;
         }
 
-        this.members[seat] = { seat, userId, nickname: nick, gender, avatar, ws };
+        this.members[seat] = { seat, userId, playerId, nickname: nick, gender, avatar, ws };
         // 第一个进房的人当房主；房主走后由 leave 路径移交
         if (this.ownerSeat < 0) this.ownerSeat = seat;
         return seat;
@@ -420,6 +423,7 @@ export class Room {
             this.members[s] = {
                 seat: s,
                 userId: -1000 - s,
+                playerId: 'AI',
                 nickname: `机器人${s + 1}号`,
                 gender: 0,
                 avatar: '',
@@ -831,6 +835,7 @@ export class Room {
                 seats.push({
                     seat: s,
                     userId: m ? m.userId : 0,
+                    playerId: m ? (m.isAI ? 'AI' : (m.playerId || '')) : '',
                     nickname: m ? m.nickname : '（空位）',
                     offline,
                     ai: !!(m && m.isAI),

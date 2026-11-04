@@ -339,6 +339,8 @@ wugui4/
 
 - **服务器权威**：客户端只发动作，合法性由服务器的 `GameEngine.ts` 判定——联机对战服直接复用客户端的纯逻辑引擎（Card/Pattern/GameEngine/AI 原样编译进服务器），规则改一处两端同步生效。
 - 冒烟测试：`gameserver/test/smoke.js` 用 4 个假客户端托管打完整局，**连跑 8 次 8/8 通过**。
+- 测试脚本默认连 `ws://localhost:8090`；端口被占时可换 `WS_URL=ws://localhost:8110 node test/xxx.js`
+  （smoke 用 `PORT=8110`）。房间流程专项：`npm run roomtest`（18 项）。
 
 ### 启动步骤
 
@@ -356,9 +358,32 @@ cd gameserver && npm install && npm run build && npm start
 cd gameserver && npm run smoke
 ```
 
+### 试玩数据报告（线下实测用）
+
+每局自动写 `gameserver/logs/rounds-YYYY-MM-DD.jsonl`。收工后一条命令出报告：
+
+```bash
+cd gameserver
+npm run report        # 生成 ../data/analysis.md，并把原始记录复制到 ../data/raw/
+cd ..
+git add data && git commit -m "data: X 月 X 日试玩 N 局"
+```
+
+报告内容：总对局数 / 平均局时长 / 敌人胜率 / 掉线率 / 托管率 / AI 补位率、
+**逐日留存表（新玩家、回访玩家、相邻两天都在的人数）**、每位玩家的局数与胜率。
+口径与文件说明见 [`data/README.md`](data/README.md)。
+
+> 为什么要提交进 git：数据只存在跑服那台电脑上会丢；而 **git 的时间戳不可事后倒填**，
+> 是「这批记录确实是当时产生的」最直接的证据。
+
+### 微信小游戏构建
+
+注册 AppID、Cocos 构建参数、真机预览、域名/证书/合法域名、上传体验版、
+常见翻车点，见 [`docs/wechat-build.md`](docs/wechat-build.md)。
+
 ### 协议摘要（gameserver）
 
-- 客户端：`login`（带 `userId`+`token` 表示重连）→ `join` / `create` / `joinCode` → `ready` → `act`（play/pass/auto）→ `next`；房主 `startGame` / `dissolve`；主动退出发 `leave`；心跳 `ping`
+- 客户端：`login`（带 `userId`+`token` 表示重连；带 `playerId` 是持久设备号）→ `join` / `create` / `joinCode` → `ready` → `act`（play/pass/auto）→ `next`；房主 `startGame` / `dissolve`；主动退出发 `leave`；心跳 `ping`
 - 服务器：`loginOk`（**签发 userId+token**）/ `roomOk`（含 6 位房间号 `code`、`isPrivate`、`ownerSeat`）/ `roundStart` / `hand`（私密手牌）/ `turn` / `exTurn` / `ex` / `timer` / `played` / `state` / `roundEnd` / `tip` / `roomClosed` / `error`
 - **私有房（创建/加入）**：进房后停在褐色房间等待页，`members` 每项含 `{seat, nickname, gender, avatar, connected, owner}`，空位是 `{seat, empty:true}`。
   房主点「开始游戏」才发牌；房主可「解散房间」；房主主动退出时按座位号顺序把房主移交给下一个人，房间不解散。
@@ -373,5 +398,12 @@ cd gameserver && npm run smoke
   参数可用环境变量调：`WG_EX_WAIT=10 WG_PLAY_WAIT=10 npm start`
 - **匹配**：等 30 秒还不满 4 人 → AI 补位开局；私有房用 6 位房间号邀请，不参与快速匹配
 - **对局记录**：每局结束落盘 `gameserver/logs/rounds-YYYY-MM-DD.jsonl`
-  （时间/房间/四家昵称/敌人/胜负/名次/时长/掉线座位/托管座位），不依赖 MySQL，起服就有数据
+  （时间/房间/四家昵称/**playerId**/敌人/胜负/名次/时长/掉线座位/托管座位），不依赖 MySQL，起服就有数据
+- **稳定身份（跨重启）**：客户端首次进入生成 `playerId` 存在本地，登录时上报；
+  服务器把 `playerId → userId` 写进 `gameserver/data/players.json`，**重启对战服后同一个人还是同一个 userId**。
+  这是跨天留存能算出来的前提（以前 userId 进程内自增，重启归零 → 第二天的人全变新玩家）。
+  匿名连接（测试脚本）不发 playerId，从 90 万号段拿临时号，不落盘、不影响真实玩家。
+- **积分与战绩上报**：联机局结算时也走 `applyRoundResult`（赢 +15 / 输 -10），
+  与单机同一套规则；同时 `net/ApiClient.ts` 会调 backend 的 `/api/auth/guest`（或微信环境的 `/api/auth/wx`）
+  和 `/api/matches` 上报战绩。**backend 没启动就静默跳过，不影响牌局**（一次失败后 5 分钟内不再重试）。
 - **安全**：userId 由服务器签发，客户端伪造的 userId 不再被采信；ws 每 20 秒心跳一次，两轮无响应即回收

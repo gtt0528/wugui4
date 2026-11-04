@@ -1,6 +1,6 @@
 /** 验证：B 取消匹配（断开）后，A 应收到 memberUpdate（1/4），C 再进来应为 2/4 */
 const WebSocket = require('ws');
-const URL = 'ws://localhost:8090';
+const URL = process.env.WS_URL || 'ws://localhost:8090';
 
 function client(name) {
     const ws = new WebSocket(URL);

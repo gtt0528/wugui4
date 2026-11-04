@@ -12,6 +12,7 @@ import {
     loadProfile, saveProfile, canPlay, applyRelief, winRate, RELIEF_SCORE,
 } from '../core/Profile';
 import { NetClient } from '../net/NetClient';
+import { ApiClient } from '../net/ApiClient';
 import { setupShare, share, launchQuery, showRewardedAd, isWechat } from '../net/WxAdapter';
 import { serverCfg, prodNotConfigured } from '../net/Config';
 import { RoomWaitView, RoomViewState } from './RoomWaitView';
@@ -49,6 +50,18 @@ export default class MenuScene extends cc.Component {
         this.buildFooter();
         this.buildRoomWait();
         this.refreshProfile();
+
+        // 战绩服务：登录 + 拉云端累计。后端没启动就静默跳过，界面照常
+        ApiClient.inst.ensureLogin()
+            .then((ok) => (ok ? ApiClient.inst.fetchMe() : null))
+            .then((me) => {
+                if (!me || !this.lblStats || !this.lblStats.isValid) return;
+                const p = loadProfile();
+                this.lblStats.string =
+                    `胜 ${p.wins} · 负 ${p.losses} · 胜率 ${winRate()}%` +
+                    (me.totalGames ? ` · 云端 ${me.totalGames} 局` : '');
+            })
+            .catch(() => { /* 忽略：后端不可用不影响本地 */ });
 
         // 转发文案：带上房间号，好友点开卡片能直接进同一个房间
         setupShare(() => ({

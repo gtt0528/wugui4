@@ -15,6 +15,13 @@ import * as path from 'path';
 export interface SeatRecord {
     seat: number;
     userId: number;
+    /**
+     * 客户端持久设备号（跨服务重启稳定）。
+     * 与 userId 的区别：userId 是服务器分配的号，早期版本重启会变；
+     * playerId 存在玩家设备上，同一个人第二天再来还是它 —— 留存就靠这个算。
+     * AI 补位是 'AI'，老客户端/测试脚本可能为空串。
+     */
+    playerId: string;
     nickname: string;
     /** 本局是否掉线过 */
     offline: boolean;

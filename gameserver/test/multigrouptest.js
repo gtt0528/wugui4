@@ -7,7 +7,7 @@
  * 出牌阶段用 auto 托管加速（交牌之外的出牌不是本次验证重点）。
  */
 const WebSocket = require('ws');
-const URL = 'ws://localhost:8090';
+const URL = process.env.WS_URL || 'ws://localhost:8090';
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
 class Bot {

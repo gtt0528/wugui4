@@ -5,7 +5,7 @@
  *    新匹配玩家进入的是全新房间（第 1 局 roundNo=1）
  */
 const WebSocket = require('ws');
-const URL = 'ws://localhost:8090';
+const URL = process.env.WS_URL || 'ws://localhost:8090';
 
 class Bot {
     constructor(name) {

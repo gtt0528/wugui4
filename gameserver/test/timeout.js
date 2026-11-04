@@ -4,7 +4,7 @@
  *   预期：挂机那位每次都被服务器自动托管，对局能一路打到结算。
  */
 const WebSocket = require('ws');
-const URL = 'ws://localhost:8090';
+const URL = process.env.WS_URL || 'ws://localhost:8090';
 const clients = [];
 
 function makeClient(name, idle) {

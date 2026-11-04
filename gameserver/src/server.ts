@@ -33,6 +33,8 @@
  */
 import { WebSocketServer, WebSocket } from 'ws';
 import { randomBytes } from 'crypto';
+import * as fs from 'fs';
+import * as path from 'path';
 import { Room } from './room';
 import { Phase } from '../../assets/scripts/core/GameEngine';
 
@@ -55,6 +57,7 @@ const alive = new Map<WebSocket, boolean>();
 
 interface ClientState {
     userId: number;
+    playerId: string;               // 客户端持久设备号（跨重启稳定，落盘用）
     nickname: string;
     gender: number;                 // 0 未知 1 男 2 女
     avatar: string;
@@ -65,18 +68,62 @@ interface ClientState {
     msgWindowAt: number;
 }
 
-let guestSeq = 1;
+// ============ 玩家档案落盘：playerId → 稳定 userId ============
+// 目的：userId 不再进程内自增（重启归零 → 跨天留存全断）。
+// 客户端首次进游戏生成 playerId 并持久保存，登录时带上；
+// 服务器把 playerId → userId 的映射写进 data/players.json，重启不丢。
+// 匿名连接（测试脚本等没带 playerId 的）从 90 万段发临时号，绝不和落盘玩家撞号。
 
-function issueIdentity(): { userId: number; token: string } {
-    const userId = 100000 + guestSeq++;
-    const token = randomBytes(16).toString('hex');
-    tokens.set(userId, token);
-    return { userId, token };
+interface PlayerProfile {
+    userId: number;
+    nickname: string;
+    firstSeen: number;
+    lastSeen: number;
 }
+
+const PLAYERS_FILE = process.env.WUGUI_PLAYERS_FILE || path.join(process.cwd(), 'data', 'players.json');
+const players = new Map<string, PlayerProfile>();
+let nextUserId = 100001;
+
+function loadPlayers(): void {
+    try {
+        if (fs.existsSync(PLAYERS_FILE)) {
+            const obj = JSON.parse(fs.readFileSync(PLAYERS_FILE, 'utf8'));
+            const map = obj && typeof obj === 'object' ? obj.map : null;
+            if (map && typeof map === 'object') {
+                for (const k of Object.keys(map)) {
+                    const v = map[k];
+                    if (v && typeof v.userId === 'number') players.set(k, v as PlayerProfile);
+                }
+            }
+            if (typeof obj.nextUserId === 'number' && obj.nextUserId > nextUserId) {
+                nextUserId = obj.nextUserId;
+            }
+        }
+    } catch (err) {
+        console.error('[玩家档案] 读取失败，按空表启动:', err);
+    }
+}
+
+function savePlayers(): void {
+    try {
+        const dir = path.dirname(PLAYERS_FILE);
+        if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
+        const map: Record<string, PlayerProfile> = {};
+        for (const [k, v] of players) map[k] = v;
+        fs.writeFileSync(PLAYERS_FILE, JSON.stringify({ nextUserId, map }), 'utf8');
+    } catch (err) {
+        console.error('[玩家档案] 写入失败:', err);
+    }
+}
+loadPlayers();
+
+/** 匿名连接的临时编号（900001 起，与落盘玩家号段隔离） */
+let anonSeq = 900001;
 
 wss.on('connection', (ws: WebSocket) => {
     const st: ClientState = {
-        userId: 0, nickname: '', gender: 0, avatar: '',
+        userId: 0, playerId: '', nickname: '', gender: 0, avatar: '',
         room: null, seat: -1, msgWindow: 0, msgWindowAt: Date.now(),
     };
     clients.set(ws, st);
@@ -172,20 +219,45 @@ setInterval(() => {
 function handle(ws: WebSocket, st: ClientState, msg: Record<string, unknown>): void {
     switch (msg.t) {
         case 'login': {
-            const rawNick = String(msg.nickname || ('玩家' + guestSeq)).slice(0, 16);
+            const rawNick = String(msg.nickname || '玩家').slice(0, 16);
             const wantId = typeof msg.userId === 'number' ? msg.userId : 0;
             const wantToken = typeof msg.token === 'string' ? msg.token : '';
+            // 客户端持久设备号：跨服务重启认人用（只作档案键，不能用于顶别人座位）
+            const playerId = typeof msg.playerId === 'string' ? msg.playerId.trim().slice(0, 64) : '';
 
             // 只接受服务器自己签发过的身份；客户端瞎传的 userId 一律不认
             const valid = wantId > 0 && wantToken.length > 0 && tokens.get(wantId) === wantToken;
-            const id = valid ? { userId: wantId, token: wantToken } : issueIdentity();
+
+            let userId: number;
+            if (valid) {
+                userId = wantId;
+            } else if (playerId) {
+                // 老玩家：playerId 已落盘 → 拿回原来的 userId（重启也不变）
+                const prof = players.get(playerId);
+                if (prof) {
+                    userId = prof.userId;
+                    prof.nickname = rawNick;
+                    prof.lastSeen = Date.now();
+                } else {
+                    userId = nextUserId++;
+                    players.set(playerId, { userId, nickname: rawNick, firstSeen: Date.now(), lastSeen: Date.now() });
+                }
+                savePlayers();
+            } else {
+                // 匿名连接（测试脚本 / 老客户端）：发临时号，不落盘
+                userId = anonSeq++;
+            }
+
+            const token = randomBytes(16).toString('hex');
+            tokens.set(userId, token);
 
             st.nickname = rawNick;
-            st.userId = id.userId;
+            st.userId = userId;
+            st.playerId = playerId;
             st.gender = typeof msg.gender === 'number' ? msg.gender : 0;
             st.avatar = typeof msg.avatar === 'string' ? msg.avatar.slice(0, 512) : '';
             ws.send(JSON.stringify({
-                t: 'loginOk', userId: id.userId, token: id.token, nickname: st.nickname,
+                t: 'loginOk', userId, token, nickname: st.nickname, playerId,
             }));
             return;
         }
@@ -292,7 +364,7 @@ function handle(ws: WebSocket, st: ClientState, msg: Record<string, unknown>): v
 
 /** 进房 + 下发 roomOk + 广播成员变化（join / create / joinCode 共用） */
 function enterRoom(ws: WebSocket, st: ClientState, room: Room): void {
-    const seat = room.join(st.userId, st.nickname, ws, st.gender, st.avatar);
+    const seat = room.join(st.userId, st.nickname, ws, st.gender, st.avatar, st.playerId);
     if (seat === null) {
         ws.send(JSON.stringify({ t: 'error', code: 'ROOM_FULL', msg: '房间已满' }));
         return;

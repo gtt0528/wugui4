@@ -21,6 +21,7 @@ import {
 } from './CardView';
 import { loadProfile, applyRoundResult } from '../core/Profile';
 import { NetClient } from '../net/NetClient';
+import { ApiClient } from '../net/ApiClient';
 import OnlineGameView from './OnlineGameView';
 
 const { ccclass } = cc._decorator;
@@ -2112,6 +2113,8 @@ export default class GameScene extends cc.Component {
         const r = e.lastResult!;
         const meWin = e.isWinner(0);
         const delta = applyRoundResult(meWin);
+        // 单机战绩也上报后端（后端没起就静默跳过）
+        ApiClient.inst.reportRound({ win: meWin, delta, seat: 0, mode: 'LOCAL' });
 
         this.clearPop();
 

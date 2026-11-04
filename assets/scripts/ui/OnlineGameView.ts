@@ -17,6 +17,8 @@
 import { Card, createDeck, sortCards, sortCardsDesc } from '../core/Card';
 import { decideRevealLead, decidePlay } from '../core/AI';
 import { parsePattern, Pattern } from '../core/Pattern';
+import { loadProfile, applyRoundResult } from '../core/Profile';
+import { ApiClient } from '../net/ApiClient';
 import {
     createCardNode, createLabel, createButton, createPanel, createMultiline,
     setButtonText, CARD_W, CARD_H,
@@ -129,6 +131,8 @@ export default class OnlineGameView extends cc.Component {
     private myHand: Card[] = [];
     private handCounts: number[] = [0, 0, 0, 0];   // 服务器座位序的张数
     private phase = '';
+    /** 已经结算过的局号：重连时服务器会补发 roundEnd，避免同一局重复加分 */
+    private settledRoundNo = 0;
     private lastPlaySeat = -1;          // 服务器座位序
     private turnPlay: { mustLead: boolean } | null = null;
     /** 已点「出牌」等服务器回执（防止连点，也用于被拒绝后恢复按钮） */
@@ -221,6 +225,7 @@ export default class OnlineGameView extends cc.Component {
         // 菜单阶段就已经知道自己的座位号（roomOk），先带上；
         // 之后快照/起局消息里如果带 seat 再覆盖
         this.mySeat = this.net.mySeat >= 0 ? this.net.mySeat : 0;
+        this.settledRoundNo = 0;   // 新进牌局：结算去重归零
 
         // 消息接管
         this.net.onMsg = (m: ServerMsg) => this.onServerMsg(m);
@@ -1891,6 +1896,18 @@ export default class OnlineGameView extends cc.Component {
         const meIsEnemy = r.enemySeat === this.mySeat;
         const iWin = r.enemyWin ? meIsEnemy : r.finishOrder.indexOf(this.mySeat) >= 0;
 
+        // 联机局也计入本地积分：和单机完全同一套规则（赢 +15 / 输 -10）
+        // 重连时服务器会补发 roundEnd（resync），同一局只能结算一次
+        const rn = typeof r.roundNo === 'number' ? r.roundNo : 0;
+        let delta = 0;
+        if (rn !== this.settledRoundNo) {
+            this.settledRoundNo = rn;
+            delta = applyRoundResult(iWin);
+            // 上报后端战绩：后端没启动就静默跳过，绝不影响牌局
+            ApiClient.inst.reportRound({ win: iWin, delta, seat: this.mySeat, mode: 'ONLINE' });
+        }
+        const scoreNow = loadProfile().score;
+
         const pw = 720;
         const ph = 430;
         const panel = createPanel(pw, ph, cc.color(12, 32, 24, 245), cc.color(226, 190, 100), 18);
@@ -1944,6 +1961,9 @@ export default class OnlineGameView extends cc.Component {
         }, () => { this.net.close(); this.backToMenu(); });
         exit.parent = panel;
         exit.setPosition(120, -ph / 2 + 58);
+
+        // 积分变化提示（不占结算面板布局，走顶部提示条；补发的重复结算不提示）
+        if (delta !== 0) this.flash(`本局积分 ${delta > 0 ? '+' : ''}${delta}，当前 ${scoreNow} 分`, 3.5);
     }
 
     // ================= 杂项 =================

@@ -13,7 +13,7 @@
  * 同时验证：全场每个人都能收到 {t:'ex'} 交牌广播（四家看到同一份记录）
  */
 const WebSocket = require('ws');
-const URL = 'ws://localhost:8090';
+const URL = process.env.WS_URL || 'ws://localhost:8090';
 
 const KIND_ORDER = ['ENEMY_PUT', 'TOURIST_PICK', 'TOURIST_RETURN', 'LOSER_GIVE', 'ENEMY_RETURN', 'LOSER_PICK'];
 
